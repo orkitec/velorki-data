@@ -1,0 +1,101 @@
+name: publish-tiles
+
+# Mirrors the BRouter rd5 segment tiles from brouter.de into GitHub Releases so
+# the Velorki app never downloads from brouter.de directly.
+#
+# See scripts/publish-tiles.sh for the batching, sharding and resume logic, and
+# README.md for the base URL the app should be pointed at.
+
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: "Space-separated globs of tile names, e.g. 'E5_N4*' or 'W20_N30 W25_N60'. '*' is the planet (~10 GB, several hours)."
+        required: false
+        default: "*"
+      tag:
+        description: "Release tag. Empty means tiles-<YYYYMMDD>."
+        required: false
+        default: ""
+      keep_releases:
+        description: "How many snapshots to keep; older ones are deleted at the end."
+        required: false
+        default: "2"
+  schedule:
+    # 03:00 UTC on the 1st of every month. brouter.de rebuilds nightly, but a
+    # 10 GB re-upload every night would be gratuitous - monthly is plenty for
+    # routing data, and a workflow_dispatch run covers anything urgent.
+    - cron: "0 3 1 * *"
+
+# One run at a time. A second run must not race the first for the same release
+# assets, and two concurrent runs would double the load on brouter.de.
+# cancel-in-progress stays false so a half-finished upload is never abandoned.
+concurrency:
+  group: publish-tiles
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # A cold planet run downloads ~10 GB from brouter.de at a polite pace and
+    # uploads it again, so hours are expected. GitHub caps a job at 6 hours
+    # regardless of this value:
+    # https://docs.github.com/en/actions/reference/limits#job-execution-time
+    # If the job is killed at the cap, just re-run it with the same tag: tiles
+    # already on the release are skipped (see "Resume" in the script header).
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Show runner disk
+        run: df -h /
+
+      - name: Publish tiles
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FILTER: ${{ inputs.filter || '*' }}
+          TAG: ${{ inputs.tag }}
+          KEEP_RELEASES: ${{ inputs.keep_releases || '2' }}
+          WORK_DIR: ${{ runner.temp }}/tiles
+        run: |
+          # An empty TAG input must fall back to the script's own default.
+          [ -n "${TAG:-}" ] || unset TAG
+          scripts/publish-tiles.sh
+
+      - name: Commit latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- latest.json; then
+            echo "latest.json unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add latest.json
+          git commit -m "latest.json: $(jq -r .tag latest.json)"
+          git push origin HEAD:main
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### publish-tiles"
+            echo
+            echo '```json'
+            cat latest.json 2>/dev/null || echo '(no latest.json)'
+            echo '```'
+            echo
+            echo "Releases:"
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 10
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ github.token }}

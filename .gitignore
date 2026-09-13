@@ -1,0 +1,3 @@
+# Scratch space for a local run of scripts/publish-tiles.sh.
+.tiles/
+*.rd5
