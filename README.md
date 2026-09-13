@@ -118,9 +118,21 @@ It also runs on its own at 03:00 UTC on the 1st of each month.
 
 The script processes tiles in batches — download a batch, hash it, upload it with
 `gh release upload --clobber`, delete the local files — so peak disk use is one
-batch (`BATCH_BYTES`, 2 GB) rather than the full 10 GB, which is what makes a
-planet run fit on a runner. Downloads from brouter.de are sequential, with a
-delay between files and a User-Agent naming this repository.
+batch (`BATCH_BYTES`, 2 GB) rather than the full 10 GB. Downloads from brouter.de
+are sequential, with a delay between files and a User-Agent naming this
+repository.
+
+### What a run costs
+
+Measured on the three-tile smoke run (`W20_N30 W25_N60 W75_N40`, 117.8 MB):
+**25 s** for the whole job, 19 s of it in the script — ~12 MB/s down from
+brouter.de, ~25 MB/s up to the release, and roughly 1–1.5 s of connection
+overhead per tile on top of the 1 s politeness delay.
+
+Extrapolated to the planet (1,142 tiles, 10 GB), per-tile overhead dominates the
+byte transfer, giving **roughly 1.5–2.5 hours**. That fits the 6-hour job cap
+with room to spare, but a slow day upstream could eat the margin — which is what
+the resume path below is for.
 
 ### If a run is cut off
 
@@ -155,7 +167,7 @@ cache per tile, and a release holding two formats would hand them segments their
 | Total release size / bandwidth | none documented | same — *"There is no limit on the total size of a release, nor bandwidth usage."* |
 | Job execution time | 6 h hard cap | [Actions limits](https://docs.github.com/en/actions/reference/limits) |
 | Workflow run time | 35 days | [Actions limits](https://docs.github.com/en/actions/reference/limits) |
-| Runner disk | ~14 GB free on `ubuntu-latest` | [Runner images](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories) |
+| Runner disk | 14 GB SSD documented; ~87 GB free measured | [Runner images](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories) |
 
 Scheduled workflows are disabled automatically after 60 days of repository
 inactivity ([docs](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)) —

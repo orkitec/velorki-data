@@ -7,9 +7,11 @@
 #
 # Why it looks like this
 # ----------------------
-#   * Disk. The planet is ~10 GB and a GitHub runner has ~14 GB free, so tiles
-#     are processed in batches: download a batch, hash it, upload it, delete it.
-#     Peak disk usage is one batch ($BATCH_BYTES), not the whole planet.
+#   * Disk. The planet is ~10 GB. The docs budget a standard runner at 14 GB of
+#     SSD, though a 2026 ubuntu-latest actually reports ~87 GB free, so this is
+#     headroom rather than a wall today. Tiles are still processed in batches -
+#     download a batch, hash it, upload it, delete it - so peak disk usage is one
+#     batch ($BATCH_BYTES) and the job does not depend on which figure is true.
 #   * The 1000-asset limit. GitHub allows at most 1000 assets per release and
 #     the planet is 1142 tiles, so a snapshot is split into shards of at most
 #     $SHARD_TILES tiles, each its own release with its own manifest.json.
@@ -285,11 +287,18 @@ update_latest_pointer() {
 
 # ----------------------------------------------------------------- pruning ---
 # Keep the $KEEP_RELEASES newest snapshots (all shards of each); delete the rest.
+#
+# Ordering is by publishedAt, not by gh's default list order: a release's
+# createdAt is the *tag's* commit date, so two snapshots cut from the same commit
+# tie and could order arbitrarily. $TAG is also prepended unconditionally, so the
+# snapshot this run just published can never be the one pruned.
 prune_releases() {
   local keep snap t
-  keep="$(gh release list --repo "$GH_REPO" --limit 200 --json tagName \
-            --jq '.[].tagName' \
-          | sed -E 's/-s[0-9]+$//' | awk '!seen[$0]++' | head -n "$KEEP_RELEASES")"
+  keep="$( { printf '%s\n' "$TAG"
+             gh release list --repo "$GH_REPO" --limit 200 --json tagName,publishedAt \
+               --jq 'sort_by(.publishedAt) | reverse | .[].tagName' \
+             | sed -E 's/-s[0-9]+$//'
+           } | awk '!seen[$0]++' | head -n "$KEEP_RELEASES")"
   if [ -z "$keep" ]; then
     log "no releases listed, nothing to prune"
     return 0
