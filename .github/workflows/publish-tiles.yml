@@ -43,7 +43,7 @@ jobs:
     # A cold planet run downloads ~10 GB from brouter.de at a polite pace and
     # uploads it again, so hours are expected. GitHub caps a job at 6 hours
     # regardless of this value:
-    # https://docs.github.com/en/actions/reference/limits#job-execution-time
+    # https://docs.github.com/en/actions/reference/limits
     # If the job is killed at the cap, just re-run it with the same tag: tiles
     # already on the release are skipped (see "Resume" in the script header).
     timeout-minutes: 360

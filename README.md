@@ -22,7 +22,7 @@ https://github.com/orkitec/velorki-data/releases/download/<tag>/
 
 The app then fetches `${VELORKI_SEGMENTS_URL}/manifest.json` and
 `${VELORKI_SEGMENTS_URL}/<TILE>.rd5`, e.g. `.../E5_N45.rd5`. Both are plain
-release assets; GitHub answers them with a 302 to `objects.githubusercontent.com`,
+release assets; GitHub answers them with a 302 to `release-assets.githubusercontent.com`,
 which supports `Range` requests, so the app's resumable downloads work unchanged.
 
 The current tag is in [`latest.json`](latest.json) on `main`, readable without
@@ -125,7 +125,7 @@ delay between files and a User-Agent naming this repository.
 ### If a run is cut off
 
 A job is capped at **6 hours** regardless of `timeout-minutes`
-([docs](https://docs.github.com/en/actions/reference/limits#job-execution-time)).
+([docs](https://docs.github.com/en/actions/reference/limits)).
 If a planet run is killed at the cap, re-run the workflow **with the same tag**:
 a tile whose asset is already on the release at the right size is skipped, and
 the manifest rows gathered so far are checkpointed onto the release as
@@ -153,7 +153,7 @@ cache per tile, and a release holding two formats would hand them segments their
 | Assets per release | 1000 | [About releases](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#storage-and-bandwidth-quotas) |
 | Size per asset | < 2 GiB | same (largest tile today is ~252 MB) |
 | Total release size / bandwidth | none documented | same — *"There is no limit on the total size of a release, nor bandwidth usage."* |
-| Job execution time | 6 h hard cap | [Actions limits](https://docs.github.com/en/actions/reference/limits#job-execution-time) |
+| Job execution time | 6 h hard cap | [Actions limits](https://docs.github.com/en/actions/reference/limits) |
 | Workflow run time | 35 days | [Actions limits](https://docs.github.com/en/actions/reference/limits) |
 | Runner disk | ~14 GB free on `ubuntu-latest` | [Runner images](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories) |
 
