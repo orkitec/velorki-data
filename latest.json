@@ -1,5 +1,17 @@
 {
-  "tag": null,
-  "generatedAt": null,
-  "note": "Written by the publish-tiles workflow after its first run. The app does not read this file yet; see README.md."
+  "tag": "tiles-20260913",
+  "generatedAt": "2026-09-13T04:46:32Z",
+  "formatVersion": "11.2",
+  "brouterVersion": "v1.7.10",
+  "source": "https://brouter.de/brouter/segments4/",
+  "baseUrl": "https://github.com/orkitec/velorki-data/releases/download/tiles-20260913/",
+  "shardCount": 1,
+  "shards": [
+    {
+      "tag": "tiles-20260913",
+      "baseUrl": "https://github.com/orkitec/velorki-data/releases/download/tiles-20260913/",
+      "tileCount": 3
+    }
+  ],
+  "tileCount": 3
 }
