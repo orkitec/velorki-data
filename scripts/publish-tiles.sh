@@ -45,6 +45,14 @@ WORK_DIR="${WORK_DIR:-$PWD/.tiles}"
 # segments their lookups.dat rejects. Bump BROUTER_VERSION in the same commit.
 RD5_FORMAT_VERSION_SET="${RD5_FORMAT_VERSION:+1}"
 RD5_FORMAT_VERSION="${RD5_FORMAT_VERSION:-11.2}"
+# A format change is published only on purpose: an app that can read the new
+# format has to be in the stores first, or every rider would be told to update
+# to a version that does not exist yet. Until then the scheduled run stops
+# here and the previous snapshot stays current.
+ALLOW_FORMAT_CHANGE="${ALLOW_FORMAT_CHANGE:-0}"
+# Tags a shipped app build points at (one per line, "#" comments). Never
+# pruned, whatever KEEP_RELEASES says, so an installed app keeps its mirror.
+KEEP_TAGS_FILE="${KEEP_TAGS_FILE:-$PWD/keep-tags.txt}"
 BROUTER_VERSION="${BROUTER_VERSION:-v1.7.10}"
 
 # At most 1000 assets may be attached to one release. Each shard also carries
@@ -297,6 +305,7 @@ update_latest_pointer() {
 prune_releases() {
   local keep snap t
   keep="$( { printf '%s\n' "$TAG"
+             [ -f "$KEEP_TAGS_FILE" ] && sed -E 's/#.*//; s/[[:space:]]+//g; /^$/d' "$KEEP_TAGS_FILE"
              gh release list --repo "$GH_REPO" --limit 200 --json tagName,publishedAt \
                --jq 'sort_by(.publishedAt) | reverse | .[].tagName' \
              | sed -E 's/-s[0-9]+$//'
@@ -336,8 +345,25 @@ detect_format_version() {
   fi
 }
 
+# Stops a scheduled run from moving latest.json to a format no shipped app can
+# read. ALLOW_FORMAT_CHANGE=1 (the workflow's allow_format_change input) is the
+# deliberate step, taken after the app release.
+guard_format_change() {
+  [ -f latest.json ] || return 0
+  local current
+  current="$(jq -r '.formatVersion // empty' latest.json)"
+  [ -n "$current" ] && [ "$current" != "$RD5_FORMAT_VERSION" ] || return 0
+  if [ "$ALLOW_FORMAT_CHANGE" = "1" ]; then
+    log "format change $current -> $RD5_FORMAT_VERSION allowed by ALLOW_FORMAT_CHANGE"
+    return 0
+  fi
+  die "the mirror is on rd5 format $current but brouter.de now builds $RD5_FORMAT_VERSION; \
+ship an app that reads $RD5_FORMAT_VERSION first, then re-run with allow_format_change=true"
+}
+
 main() {
   detect_format_version
+  guard_format_change
   command -v gh >/dev/null || die "gh is not installed"
   command -v jq >/dev/null || die "jq is not installed"
   mkdir -p "$WORK_DIR"

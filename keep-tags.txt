@@ -1,0 +1,4 @@
+# Snapshot tags a shipped Velorki build points at through VELORKI_SEGMENTS_URL.
+# Listed here so prune never deletes them; remove a tag once no supported app
+# release uses it. One tag per line.
+tiles-20260913

@@ -18,9 +18,14 @@ on:
         required: false
         default: ""
       keep_releases:
-        description: "How many snapshots to keep; older ones are deleted at the end."
+        description: "How many snapshots to keep; older ones are deleted at the end. Tags in keep-tags.txt are always kept."
         required: false
         default: "2"
+      allow_format_change:
+        description: "Publish even though brouter.de moved to a new rd5 format. Only after an app that reads it is in the stores."
+        required: false
+        type: boolean
+        default: false
   schedule:
     # 03:00 UTC on the 1st of every month. brouter.de rebuilds nightly, but a
     # 10 GB re-upload every night would be gratuitous - monthly is plenty for
@@ -63,6 +68,7 @@ jobs:
           FILTER: ${{ inputs.filter || '*' }}
           TAG: ${{ inputs.tag }}
           KEEP_RELEASES: ${{ inputs.keep_releases || '2' }}
+          ALLOW_FORMAT_CHANGE: ${{ inputs.allow_format_change == true && '1' || '0' }}
           WORK_DIR: ${{ runner.temp }}/tiles
         run: |
           # An empty TAG input must fall back to the script's own default.

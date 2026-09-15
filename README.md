@@ -36,7 +36,15 @@ https://raw.githubusercontent.com/orkitec/velorki-data/main/latest.json
 pinned to a concrete tag at build time, which is the safer arrangement anyway: a
 build keeps serving the tiles it was tested against, and moving to a new snapshot
 is a deliberate change. `latest.json` is there so a future app version (or a
-release script) can discover the newest tag without hardcoding a date.
+release script) can discover the newest tag without hardcoding a date. Every tag
+a shipped build points at goes into `keep-tags.txt`, which prune never touches.
+
+**Format changes are never published by the schedule.** The manifest's
+`formatVersion` is read from the `lookups.dat` next to the tiles on brouter.de.
+When it differs from the one in `latest.json`, the run stops before publishing
+and the previous snapshot stays current, because an app that can read the new
+format has to be in the stores first. After that release, run the workflow by
+hand with `allow_format_change` ticked.
 
 ## Layout of a snapshot
 
