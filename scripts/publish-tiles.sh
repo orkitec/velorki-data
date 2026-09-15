@@ -36,12 +36,14 @@ WORK_DIR="${WORK_DIR:-$PWD/.tiles}"
 # differs from the lookups.dat it was started with, so this pair *is* the format
 # version the app and the tiles must agree on.
 #
-# HOW TO BUMP IT: read the two values out of the lookups.dat of the BRouter
-# release brouter.de is currently building segments4 with, set
-# RD5_FORMAT_VERSION to "<lookupversion>.<minorversion>", and publish under a
-# FRESH tag. Never re-run an existing tag across a version change: clients cache
-# per tile, and a release holding two formats would hand them segments their
-# lookups.dat rejects. Bump BROUTER_VERSION in the same commit.
+# The pair is read from the lookups.dat published next to the tiles (see
+# detect_format_version), so a bump upstream reaches the manifest on the next
+# run and older apps refuse the tiles instead of misreading them. Set
+# RD5_FORMAT_VERSION explicitly to override; the default is only a fallback for
+# a mirror without the file. Always publish a version change under a FRESH tag:
+# clients cache per tile, and a release holding two formats would hand them
+# segments their lookups.dat rejects. Bump BROUTER_VERSION in the same commit.
+RD5_FORMAT_VERSION_SET="${RD5_FORMAT_VERSION:+1}"
 RD5_FORMAT_VERSION="${RD5_FORMAT_VERSION:-11.2}"
 BROUTER_VERSION="${BROUTER_VERSION:-v1.7.10}"
 
@@ -314,7 +316,28 @@ prune_releases() {
 }
 
 # -------------------------------------------------------------------- main ---
+# Reads the version pair out of the lookups.dat next to the tiles.
+detect_format_version() {
+  [ -n "$RD5_FORMAT_VERSION_SET" ] && return 0
+  local f="$WORK_DIR/lookups.dat" major minor
+  mkdir -p "$WORK_DIR"
+  if ! curl -fsSL --retry 3 --retry-delay 5 --max-time 120 -A "$USER_AGENT" \
+        "${SEGMENTS_URL%/}/lookups.dat" -o "$f"; then
+    log "WARN no lookups.dat on the mirror; formatVersion stays $RD5_FORMAT_VERSION"
+    return 0
+  fi
+  major="$(sed -n 's/^---lookupversion:[[:space:]]*//p' "$f" | head -1 | tr -d '[:space:]')"
+  minor="$(sed -n 's/^---minorversion:[[:space:]]*//p' "$f" | head -1 | tr -d '[:space:]')"
+  if [ -n "$major" ] && [ -n "$minor" ]; then
+    RD5_FORMAT_VERSION="$major.$minor"
+    log "rd5 format version $RD5_FORMAT_VERSION (from lookups.dat)"
+  else
+    log "WARN lookups.dat has no version header; formatVersion stays $RD5_FORMAT_VERSION"
+  fi
+}
+
 main() {
+  detect_format_version
   command -v gh >/dev/null || die "gh is not installed"
   command -v jq >/dev/null || die "jq is not installed"
   mkdir -p "$WORK_DIR"
