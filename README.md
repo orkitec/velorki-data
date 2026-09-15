@@ -32,19 +32,21 @@ the API at
 https://raw.githubusercontent.com/orkitec/velorki-data/main/latest.json
 ```
 
-**The app does not read `latest.json` yet.** Today `VELORKI_SEGMENTS_URL` is
-pinned to a concrete tag at build time, which is the safer arrangement anyway: a
-build keeps serving the tiles it was tested against, and moving to a new snapshot
-is a deliberate change. `latest.json` is there so a future app version (or a
-release script) can discover the newest tag without hardcoding a date. Every tag
-a shipped build points at goes into `keep-tags.txt`, which prune never touches.
+**The app follows `latest.json`.** `VELORKI_SEGMENTS_URL` in the app is the
+raw URL above; the app reads the pointer, takes `baseUrl` (shard 1) and fetches
+that snapshot's `manifest.json`. A monthly run therefore reaches riders without
+an app release. A build can still be pinned to a tag's base URL instead; every
+tag a shipped build points at goes into `keep-tags.txt`, which prune never
+touches.
 
-**Format changes are never published by the schedule.** The manifest's
+**A format change never moves `latest.json` by itself.** The manifest's
 `formatVersion` is read from the `lookups.dat` next to the tiles on brouter.de.
-When it differs from the one in `latest.json`, the run stops before publishing
-and the previous snapshot stays current, because an app that can read the new
-format has to be in the stores first. After that release, run the workflow by
-hand with `allow_format_change` ticked.
+When it differs from the one in `latest.json`, the snapshot is still published
+under its tag, but the run writes `next.json` instead of moving `latest.json`:
+riders stay on the last snapshot their app can read, and the next app release is
+built and tested against `next.json`. Once that app is in the stores, run the
+workflow by hand with `allow_format_change` ticked; `latest.json` moves and
+`next.json` can be deleted.
 
 ## Layout of a snapshot
 

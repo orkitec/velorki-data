@@ -45,11 +45,13 @@ WORK_DIR="${WORK_DIR:-$PWD/.tiles}"
 # segments their lookups.dat rejects. Bump BROUTER_VERSION in the same commit.
 RD5_FORMAT_VERSION_SET="${RD5_FORMAT_VERSION:+1}"
 RD5_FORMAT_VERSION="${RD5_FORMAT_VERSION:-11.2}"
-# A format change is published only on purpose: an app that can read the new
-# format has to be in the stores first, or every rider would be told to update
-# to a version that does not exist yet. Until then the scheduled run stops
-# here and the previous snapshot stays current.
+# A format change moves latest.json only on purpose: an app that can read the
+# new format has to be in the stores first, or every rider would be told to
+# update to a version that does not exist yet. Until then the snapshot is
+# still published under its tag, but next.json points at it instead of
+# latest.json, so the new app can be built and tested against it.
 ALLOW_FORMAT_CHANGE="${ALLOW_FORMAT_CHANGE:-0}"
+POINTER_FILE="latest.json"
 # Tags a shipped app build points at (one per line, "#" comments). Never
 # pruned, whatever KEEP_RELEASES says, so an installed app keeps its mirror.
 KEEP_TAGS_FILE="${KEEP_TAGS_FILE:-$PWD/keep-tags.txt}"
@@ -291,8 +293,8 @@ update_latest_pointer() {
     { tag: $tag, generatedAt: $gen, formatVersion: $fv, brouterVersion: $bv,
       source: $src, baseUrl: $base, shardCount: ($shards | length),
       shards: $shards, tileCount: ($shards | map(.tileCount) | add // 0) }' \
-    > latest.json || die "could not write latest.json"
-  log "latest.json -> $TAG ($of shard(s))"
+    > "$POINTER_FILE" || die "could not write $POINTER_FILE"
+  log "$POINTER_FILE -> $TAG ($of shard(s))"
 }
 
 # ----------------------------------------------------------------- pruning ---
@@ -345,20 +347,23 @@ detect_format_version() {
   fi
 }
 
-# Stops a scheduled run from moving latest.json to a format no shipped app can
-# read. ALLOW_FORMAT_CHANGE=1 (the workflow's allow_format_change input) is the
-# deliberate step, taken after the app release.
+# Keeps latest.json on a format shipped apps can read. A snapshot in a new
+# format is published all the same, under its own tag, and next.json points at
+# it: that is what the next app release is built and tested against.
+# ALLOW_FORMAT_CHANGE=1 (the workflow's allow_format_change input) moves
+# latest.json, the deliberate step after that release.
 guard_format_change() {
   [ -f latest.json ] || return 0
   local current
   current="$(jq -r '.formatVersion // empty' latest.json)"
   [ -n "$current" ] && [ "$current" != "$RD5_FORMAT_VERSION" ] || return 0
   if [ "$ALLOW_FORMAT_CHANGE" = "1" ]; then
-    log "format change $current -> $RD5_FORMAT_VERSION allowed by ALLOW_FORMAT_CHANGE"
+    log "format change $current -> $RD5_FORMAT_VERSION: latest.json moves (allowed)"
     return 0
   fi
-  die "the mirror is on rd5 format $current but brouter.de now builds $RD5_FORMAT_VERSION; \
-ship an app that reads $RD5_FORMAT_VERSION first, then re-run with allow_format_change=true"
+  POINTER_FILE="next.json"
+  log "format change $current -> $RD5_FORMAT_VERSION: publishing, but latest.json stays; next.json will point at $TAG"
+  log "ship an app that reads $RD5_FORMAT_VERSION, then re-run with allow_format_change=true"
 }
 
 main() {
