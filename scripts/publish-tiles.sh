@@ -60,7 +60,9 @@ BROUTER_VERSION="${BROUTER_VERSION:-v1.7.10}"
 # At most 1000 assets may be attached to one release. Each shard also carries
 # manifest.json and manifest.tsv, so the tile cap leaves room for those and for
 # upstream growth.
-SHARD_TILES="${SHARD_TILES:-900}"
+# Halved from 900 since publish-gazetteer adds a <TILE>.gaz beside every rd5:
+# two assets per tile plus manifest.json and README must stay under the cap.
+SHARD_TILES="${SHARD_TILES:-480}"
 # Upload (and free) once a batch reaches this many bytes on disk.
 BATCH_BYTES="${BATCH_BYTES:-2000000000}"
 # Seconds to wait between two downloads from brouter.de.

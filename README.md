@@ -54,6 +54,7 @@ workflow by hand with `allow_format_change` ticked; `latest.json` moves and
 | --- | --- |
 | `manifest.json` | What the app parses: every tile on *this release* with size, mtime and SHA-256 |
 | `<TILE>.rd5` | One BRouter segment file, e.g. `E5_N45.rd5` |
+| `<TILE>.gaz` | The offline-search index for that tile, when there is one - see [Offline search files](#offline-search-files) |
 | `manifest.tsv` | Internal resume checkpoint for the workflow; not used by the app |
 
 `manifest.json` is the shape `brouter/updater/sync.sh` writes and
@@ -79,6 +80,83 @@ workflow by hand with `allow_format_change` ticked; `latest.json` moves and
 Unlike the self-hosted updater, this mirror always publishes `sha256`: the tiles
 cross two networks and an object store on the way here, and a hash per tile is
 cheap when it is computed once a month rather than on every sync pass.
+
+## Offline search files
+
+Next to each `<TILE>.rd5` a snapshot may carry a `<TILE>.gaz`: a small SQLite
+file holding the places, POIs and (optionally) street names inside that tile,
+with an FTS5 index over their names. It is what makes the app's search box work
+with no network. The builder and the file format live in the app repository at
+[`tools/gazetteer`](https://github.com/orkitec/velorki/tree/main/tools/gazetteer);
+a file is a few hundred kB to a couple of MB against a 1-250 MB `.rd5`.
+
+The tiles are the same 5 x 5 degree grid as the segments, so the app asks for
+`<baseUrl>/<TILE>.gaz` with the tile name it already has. It only does so when
+that tile's entry in `manifest.json` carries a `gazetteer` object:
+
+```json
+{ "tile": "W20_N30", "bytes": 1527283, "updatedAt": "...", "sha256": "...",
+  "gazetteer": { "bytes": 262144, "sha256": "…", "updatedAt": "2026-09-16T01:00:00Z" } }
+```
+
+No `gazetteer` object means this mirror has no search index for that tile, and
+the app falls back to online search. The object's `sha256` is mandatory: the
+files are small enough to hash on every run.
+
+### Where they come from
+
+Unlike the `.rd5` files there is no upstream to mirror, so `publish-gazetteer`
+builds them from OpenStreetMap:
+
+1. **plan** reads Geofabrik's [`index-v1.json`](https://download.geofabrik.de/index-v1.json),
+   takes the *leaf* extracts in the chosen scope (the smallest extracts that
+   still tile the area, minus Geofabrik's combination extracts like `europe/dach`
+   whose content is already covered), sizes each with a HEAD, and balances them
+   into at most 24 groups of equal byte totals.
+2. **build** runs one matrix job per group: download one extract, `build.py` it
+   into `out/<region>/`, delete the extract, next. A runner has ~14 GB of free
+   disk and 16 GB of RAM, which is why the planet is never one pass over one
+   file and why only one PBF is ever held at a time. A region that fails is
+   reported, not fatal.
+3. **publish** downloads every group's artifact, merges them (Geofabrik extracts
+   overlap, and a tile is normally cut by several of them, so `merge.py` dedupes
+   by OSM id and rebuilds the index), validates the result, then walks the
+   snapshot's shards: each `.gaz` goes to the shard whose `manifest.json` lists
+   its tile, and that manifest gets its `gazetteer` objects refreshed. A merged
+   tile with no `.rd5` anywhere in the snapshot is counted in the step summary
+   and not uploaded.
+
+It runs on `workflow_run` when `publish-tiles` finishes successfully, so the
+monthly snapshot on the 1st is followed by its gazetteers without a second
+schedule to keep in sync. Uploads are idempotent: an asset already on the
+release at the same size is left alone, and a re-run into the same tag only
+fills the gaps.
+
+### The asset budget
+
+A `.gaz` is a release asset like an `.rd5`, so a shard that carries both holds
+twice as many. GitHub's cap is **1000 assets per release**, which is why
+`publish-tiles.sh` fills a shard with at most 480 tiles (480 rd5 + 480 gaz +
+`manifest.json` + `manifest.tsv`): the planet is three shards instead of two.
+
+### Running it by hand
+
+`Actions → publish-gazetteer → Run workflow`:
+
+* **scope** — `world` (~79 GB of PBF across 512 extracts), `europe` (~31 GB,
+  219), `north-america` (~18 GB, 76), or `custom`.
+* **regions** — for `custom`, space-separated Geofabrik region ids as they read
+  in a download URL, e.g. `europe/liechtenstein europe/portugal`. They are taken
+  literally, so a non-leaf id like `europe/germany` builds that one extract.
+* **tag** — the snapshot to publish into. Empty means whatever `latest.json`
+  points at.
+
+The plan is inspectable without Actions:
+
+```sh
+python3 scripts/gazetteer-plan.py --scope europe --dry-run
+python3 scripts/gazetteer-plan.py --scope custom --regions "europe/portugal" --dry-run
+```
 
 ## Sharding, and why the planet is not one release
 
@@ -190,8 +268,9 @@ Two different things live in this repository:
 
 * **The workflow and scripts** (`.github/`, `scripts/`) are MIT — see
   [LICENSE](LICENSE).
-* **The routing tiles** (`.rd5` release assets) are **not** ours. They are
-  derived from OpenStreetMap data and are therefore licensed under the
+* **The routing tiles** (`.rd5` release assets) and the **search indexes**
+  (`.gaz`, built from Geofabrik's OpenStreetMap extracts) are **not** ours. They
+  are derived from OpenStreetMap data and are therefore licensed under the
   [Open Database License (ODbL) 1.0](https://opendatacommons.org/licenses/odbl/1-0/):
 
   > © OpenStreetMap contributors, ODbL 1.0.

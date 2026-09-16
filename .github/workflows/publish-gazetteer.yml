@@ -1,0 +1,174 @@
+name: publish-gazetteer
+
+# Builds the offline-search gazetteer files and publishes a `<TILE>.gaz` next to
+# every `<TILE>.rd5` of the current snapshot.
+#
+# The rd5 tiles come from brouter.de (publish-tiles); the gazetteers are built
+# here from Geofabrik extracts, because nobody publishes them. A runner has
+# ~14 GB of free disk and 16 GB of RAM - less than one continent PBF - so the
+# planet is cut into leaf extracts, spread over a matrix of jobs that each hold
+# one PBF at a time, and the per-tile results are merged before publishing.
+#
+# See scripts/gazetteer-plan.py (which extracts, in which groups),
+# scripts/gazetteer-build.sh (one group) and scripts/publish-gazetteer.sh
+# (merge and upload), and README.md's "Offline search files".
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "What to build."
+        type: choice
+        options: [world, europe, north-america, custom]
+        default: world
+      regions:
+        description: "For scope 'custom': space-separated Geofabrik region ids, e.g. 'europe/liechtenstein europe/portugal'."
+        required: false
+        default: ""
+      tag:
+        description: "Snapshot tag to publish into. Empty means the tag in latest.json."
+        required: false
+        default: ""
+  # The gazetteers describe the tiles of a snapshot, so they follow the snapshot:
+  # publish-tiles runs monthly on the 1st and this starts when it finishes. The
+  # scope is always the world here; a narrower run is a workflow_dispatch.
+  workflow_run:
+    workflows: [publish-tiles]
+    types: [completed]
+
+# One run at a time: two runs would race for the same release assets and would
+# double the load on Geofabrik. cancel-in-progress stays false so a half-finished
+# upload is never abandoned.
+concurrency:
+  group: publish-gazetteer
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    # A publish-tiles run that failed leaves the snapshot half-written; there is
+    # nothing to hang gazetteers off yet.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      groups: ${{ steps.plan.outputs.groups }}
+      regions: ${{ steps.plan.outputs.regions }}
+    steps:
+      # No ref: a workflow_dispatch on a branch tests that branch's scripts;
+      # a workflow_run lands on the default branch by itself.
+      - uses: actions/checkout@v4
+
+      - name: Plan the extracts
+        id: plan
+        env:
+          SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'world' }}
+          REGIONS: ${{ inputs.regions }}
+        run: |
+          python3 scripts/gazetteer-plan.py --scope "$SCOPE" --regions "$REGIONS"
+
+      - name: Summary
+        env:
+          SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'world' }}
+        run: |
+          {
+            echo "### publish-gazetteer: plan"
+            echo
+            echo "Scope \`$SCOPE\`: ${{ steps.plan.outputs.regions }} extract(s) in ${{ steps.plan.outputs.groups }} group(s), ${{ steps.plan.outputs.mb }} MB of PBF."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # One runner per group. 20 at a time keeps a world run inside a normal
+      # concurrency budget and keeps Geofabrik at 20 sequential streams, not 24.
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    # The heaviest group is a few GB of PBF at ~6-9 MB/s of parsing plus the
+    # downloads. GitHub caps a job at 6 h regardless of this value; a group that
+    # hits the cap is re-run on its own with scope 'custom'.
+    timeout-minutes: 300
+    steps:
+      # No ref: a workflow_dispatch on a branch tests that branch's scripts;
+      # a workflow_run lands on the default branch by itself.
+      - uses: actions/checkout@v4
+
+      - name: Check out the gazetteer builder
+        uses: actions/checkout@v4
+        with:
+          repository: orkitec/velorki
+          ref: main
+          path: velorki
+          sparse-checkout: tools/gazetteer
+          sparse-checkout-cone-mode: false
+
+      - name: Install pyosmium
+        run: pip install osmium
+
+      - name: Show runner disk
+        run: df -h /
+
+      - name: Build ${{ matrix.group.name }}
+        env:
+          REGIONS: ${{ matrix.group.regions }}
+          GAZETTEER_DIR: ${{ github.workspace }}/velorki/tools/gazetteer
+          OUT_DIR: ${{ github.workspace }}/out
+          WORK_DIR: ${{ runner.temp }}/gaz
+        run: scripts/gazetteer-build.sh
+
+      # always(): a group where one region failed still holds good tiles for the
+      # others, and FAILED.txt is how the publish job reports the gap.
+      - name: Upload ${{ matrix.group.name }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gaz-${{ matrix.group.name }}
+          path: out
+          retention-days: 7
+          if-no-files-found: ignore
+
+  publish:
+    needs: [plan, build]
+    # Runs as long as the plan worked and at least one group produced an
+    # artifact: a world run that loses two groups out of 24 should still publish
+    # the other 22 and say which are missing. With no artifact at all the
+    # download step finds nothing and the script stops with a clear error.
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # No ref: a workflow_dispatch on a branch tests that branch's scripts;
+      # a workflow_run lands on the default branch by itself.
+      - uses: actions/checkout@v4
+
+      - name: Check out the gazetteer tools
+        uses: actions/checkout@v4
+        with:
+          repository: orkitec/velorki
+          ref: main
+          path: velorki
+          sparse-checkout: tools/gazetteer
+          sparse-checkout-cone-mode: false
+
+      - name: Download the built parts
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gaz-*
+          path: parts
+
+      - name: Merge and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GAZETTEER_DIR: ${{ github.workspace }}/velorki/tools/gazetteer
+          PARTS_DIR: ${{ github.workspace }}/parts
+          MERGED_DIR: ${{ github.workspace }}/merged
+          WORK_DIR: ${{ runner.temp }}/gaz-publish
+          TAG: ${{ inputs.tag }}
+        run: scripts/publish-gazetteer.sh
