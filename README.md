@@ -33,9 +33,9 @@ https://raw.githubusercontent.com/orkitec/velorki-data/main/latest.json
 ```
 
 **The app follows `latest.json`.** `VELORKI_SEGMENTS_URL` in the app is the
-raw URL above; the app reads the pointer, takes `baseUrl` (shard 1) and fetches
-that snapshot's `manifest.json`. A monthly run therefore reaches riders without
-an app release. A build can still be pinned to a tag's base URL instead; every
+raw URL above; the app reads the pointer and fetches the `manifest.json` of
+every shard in its `shards` array, merged into one manifest. A monthly run
+therefore reaches riders without an app release. A build can still be pinned to a tag's base URL instead; every
 tag a shipped build points at goes into `keep-tags.txt`, which prune never
 touches.
 
@@ -68,11 +68,11 @@ workflow by hand with `allow_format_change` ticked; `latest.json` moves and
   "generatedAt": "2026-09-13T12:00:00Z",
   "tag": "tiles-20260913",
   "baseUrl": "https://github.com/orkitec/velorki-data/releases/download/tiles-20260913/",
-  "shard": 1, "shardCount": 2,
+  "shard": 1, "shardCount": 3,
   "tiles": [
     { "tile": "E5_N45", "bytes": 252246016, "updatedAt": "2026-09-13T00:03:00Z", "sha256": "…" }
   ],
-  "tileCount": 900,
+  "tileCount": 480,
   "totalBytes": 9987654321
 }
 ```
@@ -163,34 +163,28 @@ python3 scripts/gazetteer-plan.py --scope custom --regions "europe/portugal" --d
 
 GitHub allows **at most 1000 assets per release**
 ([docs](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#storage-and-bandwidth-quotas)).
-The planet is currently **1,142** tiles, so one snapshot does not fit in one
-release.
+The planet is currently **1,142** tiles and a tile costs two assets (`.rd5` +
+`.gaz`), so one snapshot does not fit in one release.
 
-A snapshot is therefore split into shards of at most 900 tiles, each its own
-release:
+A snapshot is therefore split into shards of at most `SHARD_TILES` (480) tiles,
+each its own release — three for the planet:
 
 | Shard | Tag | Base URL |
 | --- | --- | --- |
 | 1 | `tiles-YYYYMMDD` | `…/releases/download/tiles-YYYYMMDD/` |
 | 2 | `tiles-YYYYMMDD-s2` | `…/releases/download/tiles-YYYYMMDD-s2/` |
+| 3 | `tiles-YYYYMMDD-s3` | `…/releases/download/tiles-YYYYMMDD-s3/` |
 
 Shards fill sequentially over the alphabetically sorted tile list, so a tile
 keeps its shard as the upstream list grows, and each shard's `manifest.json`
-lists exactly the tiles attached to that shard. **A single
-`VELORKI_SEGMENTS_URL` therefore covers one shard, not the planet.** The options:
-
-* **Point at one shard.** Works with the app exactly as it is today, and is
-  enough for any regional build — run the workflow with a `filter` covering the
-  area you ship (e.g. all of Europe is far under 900 tiles) and everything lands
-  in shard 1.
-* **Teach the app several base URLs.** `latest.json` already lists every shard
-  with its base URL and tile count, so the app could read it, merge the shard
-  manifests, and resolve a tile to the shard that holds it. This is the only way
-  to serve the whole planet from this mirror, and it is a change in the app, not
-  here.
-* **Raise `SHARD_TILES`.** Only if GitHub ever raises the 1000-asset cap. The
-  script defaults to 900 to leave room for `manifest.json`, `manifest.tsv` and
-  upstream growth.
+lists exactly the tiles attached to that shard. `latest.json` names every shard
+with its base URL and tile count in `shards`, and the app fetches all of them
+and merges the manifests, so **one `VELORKI_SEGMENTS_URL` covers the planet** as
+long as it points at the pointer. A build pinned to a shard's base URL sees only
+that shard, which is enough for a regional build: run the workflow with a
+`filter` covering the area you ship (all of Europe is 224 tiles) and everything
+lands in shard 1. `SHARD_TILES` only goes up if GitHub raises the 1000-asset
+cap; 480 leaves room for `manifest.json`, `manifest.tsv` and upstream growth.
 
 ## Running it
 
