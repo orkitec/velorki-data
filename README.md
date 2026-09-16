@@ -84,7 +84,8 @@ cheap when it is computed once a month rather than on every sync pass.
 ## Offline search files
 
 Next to each `<TILE>.rd5` a snapshot may carry a `<TILE>.gaz`: a small SQLite
-file holding the places, POIs and (optionally) street names inside that tile,
+file holding the places, points of interest, street names and house-number
+anchors inside that tile,
 with an FTS5 index over their names. It is what makes the app's search box work
 with no network. The builder and the file format live in the app repository at
 [`tools/gazetteer`](https://github.com/orkitec/velorki/tree/main/tools/gazetteer);

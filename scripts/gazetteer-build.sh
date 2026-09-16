@@ -27,8 +27,6 @@ GAZETTEER_DIR="${GAZETTEER_DIR:?GAZETTEER_DIR must point at tools/gazetteer}"
 OUT_DIR="${OUT_DIR:-out}"
 WORK_DIR="${WORK_DIR:-${TMPDIR:-/tmp}/gaz-build}"
 GEOFABRIK_URL="${GEOFABRIK_URL:-https://download.geofabrik.de}"
-# Streets roughly quadruple every file and are opt-in in build.py too.
-BUILD_STREETS="${BUILD_STREETS:-0}"
 USER_AGENT="${USER_AGENT:-velorki-data-gazetteer/1.0 (+https://github.com/orkitec/velorki-data; offline search index builder)}"
 
 log() { printf '%s [gaz-build] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
@@ -39,9 +37,6 @@ mkdir -p "$OUT_DIR" "$WORK_DIR" || exit 1
 # artifact is unzipped into parts/ next to every other group's and merge.py
 # walks the lot. Slashes would nest groups into each other's trees.
 slug() { printf '%s' "${1//\//__}"; }
-
-streets_flag=()
-[ "$BUILD_STREETS" = "1" ] && streets_flag=( --streets )
 
 n_ok=0
 n_fail=0
@@ -66,7 +61,7 @@ for region in $REGIONS; do
   # TMPDIR is pinned into WORK_DIR so build.py's on-disk node cache (used above
   # 150 MB of PBF) lands where the cleanup below can reach it.
   if TMPDIR="$WORK_DIR" python3 "$GAZETTEER_DIR/build.py" "$pbf" \
-       --out "$dest" "${streets_flag[@]}" </dev/null; then
+       --out "$dest" </dev/null; then
     n_ok=$(( n_ok + 1 ))
     log "$region: ok, $(ls -1 "$dest" | wc -l) tile file(s)"
   else
