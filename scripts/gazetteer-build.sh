@@ -55,6 +55,15 @@ for region in $REGIONS; do
     n_fail=$(( n_fail + 1 )); failed="$failed $region"
     continue
   fi
+  # Geofabrik answers a missing extract with a redirect to its front page, and
+  # curl -f is happy with that 200. A PBF starts with a BlobHeader naming
+  # "OSMHeader"; an HTML page does not.
+  if ! head -c 64 "$pbf" | grep -q OSMHeader; then
+    log "$region: FAIL download (not a PBF: $(stat -c%s "$pbf" 2>/dev/null || echo '?') bytes, $(file -b "$pbf" | cut -c1-40))"
+    rm -f "$pbf"
+    n_fail=$(( n_fail + 1 )); failed="$failed $region"
+    continue
+  fi
   log "$region: $(stat -c%s "$pbf" 2>/dev/null || echo '?') bytes, building"
 
   mkdir -p "$dest"
