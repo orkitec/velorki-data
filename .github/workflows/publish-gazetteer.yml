@@ -175,4 +175,6 @@ jobs:
           MERGED_DIR: ${{ github.workspace }}/merged
           WORK_DIR: ${{ runner.temp }}/gaz-publish
           TAG: ${{ inputs.tag }}
+          # A custom run fills gaps: merge with the tiles already published.
+          MERGE_PUBLISHED: ${{ inputs.scope == 'custom' && '1' || '0' }}
         run: scripts/publish-gazetteer.sh

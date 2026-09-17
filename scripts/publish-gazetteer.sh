@@ -24,6 +24,17 @@
 #     is left alone (these files are rebuilt from scratch every run and a size
 #     match on a few-MB SQLite file is a strong signal), but manifest.py always
 #     re-runs: it is cheap, and it is what makes the manifest match the assets.
+#   * A gap-filling run merges with what is published. With MERGE_PUBLISHED=1
+#     (the workflow sets it for scope `custom`) the .gaz already on the release
+#     is one more input to the merge for every tile the new parts touch, so
+#     rebuilding one failed extract adds its rows to the tile instead of
+#     replacing the whole tile with that extract's slice of it. A world run
+#     leaves it off: it rebuilds every tile from scratch, which is also how
+#     objects deleted in OSM leave the files.
+#   * A failed region fails the run - after publishing. What was built is still
+#     better published than withheld, but a green run with a hole in it is how
+#     fifteen missing extracts went unnoticed once; the exit code and the step
+#     summary name the regions and the re-run that fills them.
 set -uo pipefail
 
 : "${GH_REPO:?GH_REPO must be set, e.g. orkitec/velorki-data}"
@@ -36,6 +47,7 @@ POINTER_FILE="${POINTER_FILE:-latest.json}"
 # gh takes many assets per call; a few dozen keeps the command line sane and the
 # log readable without paying connection setup per file.
 UPLOAD_BATCH="${UPLOAD_BATCH:-40}"
+MERGE_PUBLISHED="${MERGE_PUBLISHED:-0}"
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 log() { printf '%s [gaz-publish] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
@@ -52,18 +64,6 @@ failed_regions=$(cat "$PARTS_DIR"/*/FAILED.txt 2>/dev/null | tr '\n' ' ')
 parts_count=$(find "$PARTS_DIR" -name '*.gaz' | wc -l)
 [ "$parts_count" -gt 0 ] || die "no .gaz files under $PARTS_DIR"
 log "$parts_count part file(s) from $regions_built region(s)"
-
-rm -rf "$MERGED_DIR"; mkdir -p "$MERGED_DIR"
-log "merging into $MERGED_DIR"
-python3 "$GAZETTEER_DIR/merge.py" "$MERGED_DIR" "$PARTS_DIR" \
-  || die "merge.py failed"
-
-shopt -s nullglob
-merged_files=( "$MERGED_DIR"/*.gaz )
-shopt -u nullglob
-[ "${#merged_files[@]}" -gt 0 ] || die "merge.py produced no files"
-log "merged ${#merged_files[@]} tile(s); validating"
-python3 "$GAZETTEER_DIR/check.py" "${merged_files[@]}" || die "check.py rejected a merged file"
 
 # --------------------------------------------------------------------- tag ---
 TAG="${TAG:-}"
@@ -85,6 +85,43 @@ while :; do
 done
 [ "${#shards[@]}" -gt 0 ] || die "no release for tag $TAG"
 log "snapshot has ${#shards[@]} shard(s): ${shards[*]}"
+
+# ------------------------------------------------------- published tiles ---
+# For a gap-filling run: the .gaz already on the release, for every tile the
+# new parts touch, so the merge below folds the new rows into it.
+merge_inputs=( "$PARTS_DIR" )
+if [ "$MERGE_PUBLISHED" = "1" ]; then
+  PUBLISHED_DIR="$WORK_DIR/published"
+  rm -rf "$PUBLISHED_DIR"; mkdir -p "$PUBLISHED_DIR"
+  find "$PARTS_DIR" -name '*.gaz' -exec basename {} .gaz \; | sort -u > "$WORK_DIR/touched.txt"
+  n_published=0
+  for shard_tag in "${shards[@]}"; do
+    gh release view "$shard_tag" --repo "$GH_REPO" --json assets --jq '.assets[].name' \
+      > "$WORK_DIR/$shard_tag.assets" 2>/dev/null || : > "$WORK_DIR/$shard_tag.assets"
+    while read -r tile; do
+      [ -n "$tile" ] || continue
+      grep -qxF "$tile.gaz" "$WORK_DIR/$shard_tag.assets" || continue
+      gh release download "$shard_tag" --repo "$GH_REPO" --pattern "$tile.gaz" \
+          --dir "$PUBLISHED_DIR" --clobber </dev/null >/dev/null 2>&1 \
+        || die "$shard_tag: could not download the published $tile.gaz"
+      n_published=$(( n_published + 1 ))
+    done < "$WORK_DIR/touched.txt"
+  done
+  log "merging with $n_published published tile(s) (MERGE_PUBLISHED=1)"
+  [ "$n_published" = "0" ] || merge_inputs+=( "$PUBLISHED_DIR" )
+fi
+
+rm -rf "$MERGED_DIR"; mkdir -p "$MERGED_DIR"
+log "merging into $MERGED_DIR"
+python3 "$GAZETTEER_DIR/merge.py" "$MERGED_DIR" "${merge_inputs[@]}" \
+  || die "merge.py failed"
+
+shopt -s nullglob
+merged_files=( "$MERGED_DIR"/*.gaz )
+shopt -u nullglob
+[ "${#merged_files[@]}" -gt 0 ] || die "merge.py produced no files"
+log "merged ${#merged_files[@]} tile(s); validating"
+python3 "$GAZETTEER_DIR/check.py" "${merged_files[@]}" || die "check.py rejected a merged file"
 
 # --------------------------------------------------------------- per shard ---
 # Every tile any shard claimed, so the leftovers can be reported at the end.
@@ -234,7 +271,7 @@ done
   fi
   echo
   if [ -n "${failed_regions// /}" ]; then
-    echo "**Region(s) that failed to build:**"
+    echo "**Region(s) that failed to build** (the run is marked failed; dispatch the workflow with scope \`custom\` and these regions to fill the gap):"
     echo
     echo '```'
     printf '%s\n' $failed_regions | fmt -w 100
@@ -245,6 +282,9 @@ done
 } >> "$SUMMARY"
 
 log "done - $total_up uploaded, $total_skip unchanged, $n_orphan tile(s) without an rd5"
-# A failed region is reported, not fatal: the rest of the planet is still
-# better published than withheld, and a re-run fills the gap.
+if [ -n "${failed_regions// /}" ]; then
+  log "FAILED region(s): $failed_regions"
+  log "fill the gap: dispatch publish-gazetteer with scope 'custom' and these regions (it merges with the published tiles)"
+  exit 1
+fi
 exit 0

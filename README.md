@@ -117,8 +117,8 @@ builds them from OpenStreetMap:
 2. **build** runs one matrix job per group: download one extract, `build.py` it
    into `out/<region>/`, delete the extract, next. A runner has ~14 GB of free
    disk and 16 GB of RAM, which is why the planet is never one pass over one
-   file and why only one PBF is ever held at a time. A region that fails is
-   reported, not fatal.
+   file and why only one PBF is ever held at a time. A region that fails does
+   not stop its group; the publish step reports it and fails the run.
 3. **publish** downloads every group's artifact, merges them (Geofabrik extracts
    overlap, and a tile is normally cut by several of them, so `merge.py` dedupes
    by OSM id and rebuilds the index), validates the result, then walks the
@@ -130,8 +130,14 @@ builds them from OpenStreetMap:
 It runs on `workflow_run` when `publish-tiles` finishes successfully, so the
 monthly snapshot on the 1st is followed by its gazetteers without a second
 schedule to keep in sync. Uploads are idempotent: an asset already on the
-release at the same size is left alone, and a re-run into the same tag only
-fills the gaps.
+release at the same size is left alone.
+
+A run with failed regions ends **failed** after publishing what it built, and
+its step summary lists them. Fill the gap by dispatching the workflow with
+scope `custom` and those region ids: a custom run merges each tile it touches
+with the `.gaz` already on the release (`MERGE_PUBLISHED=1`), so the rebuilt
+extract's rows join the tile instead of replacing it. A world run does not
+merge with the published files; it rebuilds every tile from scratch.
 
 ### The asset budget
 
