@@ -39,6 +39,7 @@ concurrency:
   group: publish-tiles
   cancel-in-progress: false
 
+# The one job creates the release, uploads the tiles and commits the pointer.
 permissions:
   contents: write
 
@@ -54,7 +55,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: main
 

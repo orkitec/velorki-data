@@ -43,8 +43,9 @@ concurrency:
   group: publish-gazetteer
   cancel-in-progress: false
 
+# Read-only for the plan and the build jobs; only `publish` touches the release.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   plan:
@@ -60,7 +61,7 @@ jobs:
     steps:
       # No ref: a workflow_dispatch on a branch tests that branch's scripts;
       # a workflow_run lands on the default branch by itself.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Plan the extracts
         id: plan
@@ -96,10 +97,10 @@ jobs:
     steps:
       # No ref: a workflow_dispatch on a branch tests that branch's scripts;
       # a workflow_run lands on the default branch by itself.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Check out the gazetteer builder
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: orkitec/velorki
           ref: main
@@ -125,7 +126,7 @@ jobs:
       # others, and FAILED.txt is how the publish job reports the gap.
       - name: Upload ${{ matrix.group.name }}
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gaz-${{ matrix.group.name }}
           path: out
@@ -134,6 +135,9 @@ jobs:
 
   publish:
     needs: [plan, build]
+    permissions:
+      # Uploads the merged .gaz files onto the snapshot release.
+      contents: write
     # Runs as long as the plan worked and at least one group produced an
     # artifact: a world run that loses two groups out of 24 should still publish
     # the other 22 and say which are missing. With no artifact at all the
@@ -144,10 +148,10 @@ jobs:
     steps:
       # No ref: a workflow_dispatch on a branch tests that branch's scripts;
       # a workflow_run lands on the default branch by itself.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Check out the gazetteer tools
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: orkitec/velorki
           ref: main
@@ -157,7 +161,7 @@ jobs:
 
       - name: Download the built parts
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: gaz-*
           path: parts
