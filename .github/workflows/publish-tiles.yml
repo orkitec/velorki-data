@@ -94,6 +94,9 @@ jobs:
             msg="latest.json: $(jq -r .tag latest.json)"
           fi
           git commit -m "$msg"
+          # main may have moved during the hours this job runs; the pointer
+          # commit rebases onto it rather than failing at the very end.
+          git pull --rebase origin main
           git push origin HEAD:main
 
       - name: Summary
