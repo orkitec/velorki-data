@@ -58,6 +58,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       groups: ${{ steps.plan.outputs.groups }}
       regions: ${{ steps.plan.outputs.regions }}
+      epoch: ${{ steps.snapshot.outputs.epoch }}
     steps:
       # No ref: a workflow_dispatch on a branch tests that branch's scripts;
       # a workflow_run lands on the default branch by itself.
@@ -70,6 +71,28 @@ jobs:
           REGIONS: ${{ inputs.regions }}
         run: |
           python3 scripts/gazetteer-plan.py --scope "$SCOPE" --regions "$REGIONS"
+
+      # Every built_at in the files is the snapshot's date (SOURCE_DATE_EPOCH),
+      # so a rebuild of the same extracts is byte-identical and publish only
+      # uploads what changed. The first shard's manifest dates the snapshot,
+      # whether the tag comes from the input or from latest.json.
+      - name: Date the snapshot
+        id: snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          tag="${TAG:-$(python3 -c 'import json; print(json.load(open("latest.json"))["tag"])')}"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern manifest.json \
+            --output "$RUNNER_TEMP/manifest.json" --clobber
+          epoch="$(python3 -c '
+          import json, sys
+          from datetime import datetime, timezone
+          stamp = json.load(open(sys.argv[1]))["generatedAt"]
+          print(int(datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()))
+          ' "$RUNNER_TEMP/manifest.json")"
+          echo "snapshot $tag, SOURCE_DATE_EPOCH=$epoch"
+          echo "epoch=$epoch" >> "$GITHUB_OUTPUT"
 
       - name: Summary
         env:
@@ -120,6 +143,7 @@ jobs:
           GAZETTEER_DIR: ${{ github.workspace }}/velorki/tools/gazetteer
           OUT_DIR: ${{ github.workspace }}/out
           WORK_DIR: ${{ runner.temp }}/gaz
+          SOURCE_DATE_EPOCH: ${{ needs.plan.outputs.epoch }}
         run: scripts/gazetteer-build.sh
 
       # always(): a group where one region failed still holds good tiles for the
@@ -175,6 +199,7 @@ jobs:
           MERGED_DIR: ${{ github.workspace }}/merged
           WORK_DIR: ${{ runner.temp }}/gaz-publish
           TAG: ${{ inputs.tag }}
+          SOURCE_DATE_EPOCH: ${{ needs.plan.outputs.epoch }}
           # A custom run fills gaps: merge with the tiles already published.
           MERGE_PUBLISHED: ${{ inputs.scope == 'custom' && '1' || '0' }}
         run: scripts/publish-gazetteer.sh

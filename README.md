@@ -130,7 +130,10 @@ builds them from OpenStreetMap:
 It runs on `workflow_run` when `publish-tiles` finishes successfully, so the
 monthly snapshot on the 1st is followed by its gazetteers without a second
 schedule to keep in sync. Uploads are idempotent: an asset already on the
-release at the same size is left alone.
+release with the same sha256 is left alone. Every file's `built_at` is the
+snapshot's date (`SOURCE_DATE_EPOCH`), so rebuilding unchanged extracts gives
+the same bytes. After each shard's manifest is uploaded it is read back and
+held to the assets: a size or sha256 that differs fails the run.
 
 A run with failed regions ends **failed** after publishing what it built, and
 its step summary lists them. Fill the gap by dispatching the workflow with

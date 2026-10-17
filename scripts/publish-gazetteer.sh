@@ -20,10 +20,16 @@
 #     so a .gaz goes to the shard whose manifest names its tile - never to the
 #     tag alone. A merged tile with no rd5 anywhere is land BRouter does not
 #     route and is reported, not uploaded.
-#   * Idempotent and resumable. An asset already on the release at the same size
-#     is left alone (these files are rebuilt from scratch every run and a size
-#     match on a few-MB SQLite file is a strong signal), but manifest.py always
-#     re-runs: it is cheap, and it is what makes the manifest match the assets.
+#   * Idempotent and resumable. An asset already on the release with the same
+#     sha256 (GitHub's asset `digest`) is left alone; anything else is uploaded.
+#     Never the size: SQLite files grow in 4 KB pages, so a rebuild with other
+#     content often has the same size, and once 268 tiles were skipped that way
+#     while the manifest took the hashes of the files that were never uploaded.
+#     The workflow sets SOURCE_DATE_EPOCH, so a rebuild of the same extracts is
+#     byte-identical and the skip still saves work. manifest.py always re-runs.
+#   * Checked against the release. After a shard's manifest is uploaded, the
+#     assets and the manifest are read back and every rd5 and gazetteer entry
+#     must name its asset's size and sha256, or the run fails naming the tiles.
 #   * A gap-filling run merges with what is published. With MERGE_PUBLISHED=1
 #     (the workflow sets it for scope `custom`) the .gaz already on the release
 #     is one more input to the merge for every tile the new parts touch, so
@@ -52,6 +58,15 @@ SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 log() { printf '%s [gaz-publish] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "FATAL $*"; exit 1; }
+
+# A release's assets as "name<TAB>size<TAB>sha256" (empty when GitHub has no
+# digest for it). The asset list is paged separately: a shard holds ~960.
+asset_digests() {
+  local release_id
+  release_id="$(gh api "repos/$GH_REPO/releases/tags/$1" --jq .id)" || return 1
+  gh api --paginate "repos/$GH_REPO/releases/$release_id/assets?per_page=100" \
+    --jq '.[] | "\(.name)\t\(.size)\t\((.digest // "") | ltrimstr("sha256:"))"'
+}
 
 mkdir -p "$WORK_DIR" || die "could not create $WORK_DIR"
 
@@ -152,9 +167,8 @@ for entry in manifest.get("tiles", []):
         print(entry["tile"])
 ' "$dir/manifest.orig.json" > "$dir/tiles.txt" || die "$shard_tag: unreadable manifest.json"
 
-  # Assets already on the release, "name<TAB>size".
-  gh release view "$shard_tag" --repo "$GH_REPO" --json assets \
-    --jq '.assets[] | "\(.name)\t\(.size)"' > "$dir/assets.tsv" 2>/dev/null || : > "$dir/assets.tsv"
+  # Assets already on the release, "name<TAB>size<TAB>sha256".
+  asset_digests "$shard_tag" > "$dir/assets.tsv" 2>/dev/null || : > "$dir/assets.tsv"
 
   n_have=0 n_up=0 n_skip=0
   batch=()
@@ -168,8 +182,8 @@ for entry in manifest.get("tiles", []):
     cp -f "$src" "$dir/$tile.gaz" || die "$shard_tag: could not stage $tile.gaz"
     n_have=$(( n_have + 1 ))
 
-    have_size="$(awk -F'\t' -v n="$tile.gaz" '$1==n {print $2; exit}' "$dir/assets.tsv")"
-    if [ -n "$have_size" ] && [ "$have_size" = "$(stat -c%s "$dir/$tile.gaz")" ]; then
+    have_sha="$(awk -F'\t' -v n="$tile.gaz" '$1==n {print $3; exit}' "$dir/assets.tsv")"
+    if [ -n "$have_sha" ] && [ "$have_sha" = "$(sha256sum "$dir/$tile.gaz" | cut -d' ' -f1)" ]; then
       n_skip=$(( n_skip + 1 ))
       continue
     fi
@@ -227,6 +241,44 @@ with open(sys.argv[2], "w") as handle:
 ' "$dir/manifest.orig.json" "$dir/manifest.json" || die "$shard_tag: could not splice manifest.json"
   gh release upload "$shard_tag" --repo "$GH_REPO" --clobber "$dir/manifest.json" </dev/null \
     || die "$shard_tag: could not upload manifest.json"
+
+  # Read back what riders will download and hold the manifest to the assets.
+  mkdir -p "$dir/check"
+  gh release download "$shard_tag" --repo "$GH_REPO" --pattern manifest.json \
+      --dir "$dir/check" --clobber </dev/null >/dev/null 2>&1 \
+    || die "$shard_tag: could not read manifest.json back"
+  asset_digests "$shard_tag" > "$dir/check/assets.tsv" \
+    || die "$shard_tag: could not read the asset digests back"
+  python3 -c '
+import json, sys
+assets = {}
+for line in open(sys.argv[2]):
+    name, size, sha = line.rstrip("\n").split("\t")
+    assets[name] = (int(size), sha)
+bad, unknown = [], 0
+for entry in json.load(open(sys.argv[1])).get("tiles", []):
+    for kind, want in (("rd5", entry), ("gaz", entry.get("gazetteer"))):
+        if not want:
+            continue
+        name = "%s.%s" % (entry["tile"], kind)
+        size, sha = assets.get(name, (None, None))
+        if size is None:
+            bad.append(name + " (no asset)")
+        elif size != want.get("bytes"):
+            bad.append("%s (asset %d bytes, manifest %s)" % (name, size, want.get("bytes")))
+        elif not sha:
+            unknown += 1
+        elif sha != want.get("sha256"):
+            bad.append("%s (asset sha256 %s, manifest %s)" % (name, sha, want.get("sha256")))
+if unknown:
+    print("%d asset(s) have no digest on GitHub and were checked by size only" % unknown)
+if bad:
+    print("%d manifest entr(ies) do not match the release:" % len(bad))
+    for line in bad:
+        print("  " + line)
+    sys.exit(1)
+' "$dir/check/manifest.json" "$dir/check/assets.tsv" \
+    || die "$shard_tag: manifest.json does not match the assets on the release"
 
   log "$shard_tag: $n_have tile(s) with a gazetteer - $n_up uploaded, $n_skip unchanged"
   summary_rows="$summary_rows| \`$shard_tag\` | $(wc -l < "$dir/tiles.txt") | $n_have | $n_up | $n_skip |"$'\n'
