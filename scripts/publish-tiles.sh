@@ -23,11 +23,30 @@
 #     previous run already published.
 #   * Politeness. brouter.de is a volunteer-run server: one sequential stream, a
 #     delay between files, and a User-Agent that says who we are.
+#   * Not live yet. The new snapshot goes to pending.json, not latest.json:
+#     apps follow latest.json, and the snapshot only becomes that once
+#     publish-gazetteer has put a gazetteer beside its tiles
+#     (scripts/promote-snapshot.sh). Pruning happens there too, after the move.
+#   * Rehearsal. REHEARSAL=1 runs the same flow on a few tiles without going
+#     near what apps read: tags are rehearsal-<YYYYMMDD>, the pointer is
+#     rehearsal/pending.json (apps only read main's top-level latest.json),
+#     and no release is marked GitHub's "latest". See README.md, "Rehearsal".
 set -uo pipefail
 
 SEGMENTS_URL="${SEGMENTS_URL:-https://brouter.de/brouter/segments4/}"
 FILTER="${FILTER:-*}"
-TAG="${TAG:-tiles-$(date -u +%Y%m%d)}"
+REHEARSAL="${REHEARSAL:-0}"
+# Rehearsal only: noted in rehearsal/pending.json for publish-gazetteer, which
+# then breaks that tile's parts to rehearse a quarantine and its carry-over.
+REHEARSAL_BREAK_TILE="${REHEARSAL_BREAK_TILE:-}"
+if [ "$REHEARSAL" = "1" ]; then
+  TAG_PREFIX="rehearsal-"
+  POINTER_DIR="rehearsal/"
+else
+  TAG_PREFIX="tiles-"
+  POINTER_DIR=""
+fi
+TAG="${TAG:-${TAG_PREFIX}$(date -u +%Y%m%d)}"
 WORK_DIR="${WORK_DIR:-$PWD/.tiles}"
 
 # The rd5 on-disk format is identified by the lookup version pair carried in
@@ -49,12 +68,10 @@ RD5_FORMAT_VERSION="${RD5_FORMAT_VERSION:-11.2}"
 # new format has to be in the stores first, or every rider would be told to
 # update to a version that does not exist yet. Until then the snapshot is
 # still published under its tag, but next.json points at it instead of
-# latest.json, so the new app can be built and tested against it.
+# pending.json, so it never becomes latest.json and the new app can be built
+# and tested against it.
 ALLOW_FORMAT_CHANGE="${ALLOW_FORMAT_CHANGE:-0}"
-POINTER_FILE="latest.json"
-# Tags a shipped app build points at (one per line, "#" comments). Never
-# pruned, whatever KEEP_RELEASES says, so an installed app keeps its mirror.
-KEEP_TAGS_FILE="${KEEP_TAGS_FILE:-$PWD/keep-tags.txt}"
+POINTER_FILE="${POINTER_DIR}pending.json"
 BROUTER_VERSION="${BROUTER_VERSION:-v1.7.10}"
 
 # At most 1000 assets may be attached to one release. Each shard also carries
@@ -68,12 +85,11 @@ BATCH_BYTES="${BATCH_BYTES:-2000000000}"
 # Seconds to wait between two downloads from brouter.de.
 POLITE_DELAY="${POLITE_DELAY:-1}"
 USER_AGENT="${USER_AGENT:-velorki-data-mirror/1.0 (+https://github.com/orkitec/velorki-data; mirror of brouter.de for the Velorki bike app)}"
-# Keep this many snapshots; older ones are deleted at the end of a run.
-KEEP_RELEASES="${KEEP_RELEASES:-2}"
 
 : "${GH_REPO:?GH_REPO must be set, e.g. orkitec/velorki-data}"
 REPO_URL="https://github.com/$GH_REPO"
 TAB=$'\t'
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
 log() { printf '%s [publish] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "FATAL $*"; exit 1; }
@@ -155,7 +171,8 @@ NOTES
 
 ensure_release() {
   local tag="$1" shard="$2" of="$3" latest="--latest=false"
-  [ "$shard" = "1" ] && latest="--latest"
+  # A rehearsal never becomes the release GitHub shows as the latest.
+  [ "$shard" = "1" ] && [ "$REHEARSAL" != "1" ] && latest="--latest"
   if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
     log "release $tag already exists, resuming into it"
     return 0
@@ -173,7 +190,11 @@ release_assets() {
 }
 
 # ---------------------------------------------------------------- manifest ---
-# Rows accumulate in manifest.tsv as "tile<TAB>bytes<TAB>updatedAt<TAB>sha256".
+# Rows accumulate in manifest.tsv as
+# "tile<TAB>bytes<TAB>updatedAt<TAB>sha256<TAB>contentSha256". contentSha256 is
+# the rd5 digest of snapshot.py (the file without its creation time): sha256
+# changes every month, the digest only with content. A checkpoint written
+# before the column existed has four fields; its rows have no contentSha256.
 write_manifest() {
   local state="$1" out="$2" shard="$3" of="$4"
   jq -R -s --arg fv "$RD5_FORMAT_VERSION" --arg bv "$BROUTER_VERSION" \
@@ -182,7 +203,8 @@ write_manifest() {
       --arg base "$(shard_base "$shard")" \
       --argjson shard "$shard" --argjson shards "$of" '
     [ split("\n")[] | select(length > 0) | split("\t")
-      | { tile: .[0], bytes: (.[1] | tonumber), updatedAt: .[2], sha256: .[3] } ]
+      | { tile: .[0], bytes: (.[1] | tonumber), updatedAt: .[2], sha256: .[3] }
+        + (if (.[4] // "") != "" then { contentSha256: .[4] } else {} end) ]
     | sort_by(.tile)
     | { formatVersion: $fv, brouterVersion: $bv, source: $src,
         segmentFilter: $filter, generatedAt: $gen,
@@ -227,7 +249,7 @@ publish_shard() {
 
   local batch=() batch_bytes=0
   local n_up=0 n_skip=0 n_fail=0
-  local tile bytes idxdate updated dst actual sha have_size resume
+  local tile bytes idxdate updated dst actual sha content have_size resume
 
   # The tile list is read on fd 3 so that curl/gh cannot swallow it from stdin.
   while IFS="$TAB" read -r tile bytes idxdate <&3; do
@@ -255,11 +277,13 @@ publish_shard() {
       n_fail=$(( n_fail + 1 )); continue
     fi
     sha="$(sha256sum "$dst" | cut -d' ' -f1)"
+    content="$(python3 "$HERE/snapshot.py" rd5-digest "$dst" | cut -d' ' -f1)"
+    [ -n "$content" ] || { rm -f "$dst"; log "$tag: $tile FAIL content digest"; n_fail=$(( n_fail + 1 )); continue; }
 
     # Replace any stale row for this tile, then append the fresh one.
     grep -v "^$tile$TAB" "$state" > "$state.new" 2>/dev/null || : > "$state.new"
     mv "$state.new" "$state"
-    printf '%s\t%s\t%s\t%s\n' "$tile" "$actual" "$updated" "$sha" >> "$state"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$tile" "$actual" "$updated" "$sha" "$content" >> "$state"
 
     batch+=( "$dst" ); batch_bytes=$(( batch_bytes + actual ))
     n_up=$(( n_up + 1 ))
@@ -280,8 +304,9 @@ publish_shard() {
   return 0
 }
 
-# ------------------------------------------------------------- latest.json ---
-update_latest_pointer() {
+# ----------------------------------------------------------------- pointer ---
+# pending.json (or next.json) in the shape of latest.json, which it becomes.
+write_pointer() {
   local of="$1" i shards="[]"
   for i in $(seq 1 "$of"); do
     shards="$(jq -c --arg t "$(shard_tag "$i")" --arg b "$(shard_base "$i")" \
@@ -291,41 +316,14 @@ update_latest_pointer() {
   jq -n --arg tag "$TAG" --arg gen "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --arg fv "$RD5_FORMAT_VERSION" --arg bv "$BROUTER_VERSION" \
         --arg base "$(shard_base 1)" --arg src "$SEGMENTS_URL" \
-        --argjson shards "$shards" '
+        --argjson shards "$shards" --arg brk "$REHEARSAL_BREAK_TILE" '
     { tag: $tag, generatedAt: $gen, formatVersion: $fv, brouterVersion: $bv,
       source: $src, baseUrl: $base, shardCount: ($shards | length),
-      shards: $shards, tileCount: ($shards | map(.tileCount) | add // 0) }' \
+      shards: $shards, tileCount: ($shards | map(.tileCount) | add // 0) }
+    + (if $brk == "" then {} else {rehearsal: {breakTile: $brk}} end)' \
     > "$POINTER_FILE" || die "could not write $POINTER_FILE"
   log "$POINTER_FILE -> $TAG ($of shard(s))"
-}
-
-# ----------------------------------------------------------------- pruning ---
-# Keep the $KEEP_RELEASES newest snapshots (all shards of each); delete the rest.
-#
-# Ordering is by publishedAt, not by gh's default list order: a release's
-# createdAt is the *tag's* commit date, so two snapshots cut from the same commit
-# tie and could order arbitrarily. $TAG is also prepended unconditionally, so the
-# snapshot this run just published can never be the one pruned.
-prune_releases() {
-  local keep snap t
-  keep="$( { printf '%s\n' "$TAG"
-             [ -f "$KEEP_TAGS_FILE" ] && sed -E 's/#.*//; s/[[:space:]]+//g; /^$/d' "$KEEP_TAGS_FILE"
-             gh release list --repo "$GH_REPO" --limit 200 --json tagName,publishedAt \
-               --jq 'sort_by(.publishedAt) | reverse | .[].tagName' \
-             | sed -E 's/-s[0-9]+$//'
-           } | awk '!seen[$0]++' | head -n "$KEEP_RELEASES")"
-  if [ -z "$keep" ]; then
-    log "no releases listed, nothing to prune"
-    return 0
-  fi
-  log "keeping snapshot(s): $(echo "$keep" | tr '\n' ' ')"
-  while read -r t; do
-    [ -n "$t" ] || continue
-    snap="$(sed -E 's/-s[0-9]+$//' <<<"$t")"
-    grep -qxF "$snap" <<<"$keep" && continue
-    log "deleting old release $t"
-    gh release delete "$t" --repo "$GH_REPO" --yes --cleanup-tag </dev/null || true
-  done < <(gh release list --repo "$GH_REPO" --limit 200 --json tagName --jq '.[].tagName')
+  [ -z "${GITHUB_OUTPUT:-}" ] || echo "pointer=$POINTER_FILE" >> "$GITHUB_OUTPUT"
 }
 
 # -------------------------------------------------------------------- main ---
@@ -352,23 +350,44 @@ detect_format_version() {
 # Keeps latest.json on a format shipped apps can read. A snapshot in a new
 # format is published all the same, under its own tag, and next.json points at
 # it: that is what the next app release is built and tested against.
-# ALLOW_FORMAT_CHANGE=1 (the workflow's allow_format_change input) moves
-# latest.json, the deliberate step after that release.
+# ALLOW_FORMAT_CHANGE=1 (the workflow's allow_format_change input) writes
+# pending.json as usual, the deliberate step after that release: latest.json
+# follows once the gazetteers are in, and next.json goes with that move.
 guard_format_change() {
-  [ -f latest.json ] || return 0
-  local current
-  current="$(jq -r '.formatVersion // empty' latest.json)"
+  # A rehearsal compares with its own live pointer, else with the real one.
+  local live="${POINTER_DIR}latest.json" current
+  [ -f "$live" ] || live=latest.json
+  [ -f "$live" ] || return 0
+  current="$(jq -r '.formatVersion // empty' "$live")"
   [ -n "$current" ] && [ "$current" != "$RD5_FORMAT_VERSION" ] || return 0
   if [ "$ALLOW_FORMAT_CHANGE" = "1" ]; then
-    log "format change $current -> $RD5_FORMAT_VERSION: latest.json moves (allowed)"
+    log "format change $current -> $RD5_FORMAT_VERSION: allowed, pending.json -> $TAG"
     return 0
   fi
-  POINTER_FILE="next.json"
-  log "format change $current -> $RD5_FORMAT_VERSION: publishing, but latest.json stays; next.json will point at $TAG"
+  POINTER_FILE="${POINTER_DIR}next.json"
+  log "format change $current -> $RD5_FORMAT_VERSION: publishing, but latest.json stays and nothing goes pending; next.json will point at $TAG"
   log "ship an app that reads $RD5_FORMAT_VERSION, then re-run with allow_format_change=true"
 }
 
+# The two kinds of snapshot never cross: a rehearsal tag cannot land in the
+# real pointers, nor a real one in rehearsal/, and a rehearsal is a few tiles.
+guard_mode() {
+  case "$TAG" in
+    "$TAG_PREFIX"*) ;;
+    *) die "TAG '$TAG' does not start with '$TAG_PREFIX' (REHEARSAL=$REHEARSAL)" ;;
+  esac
+  if [ "$REHEARSAL" = "1" ] && [ "$FILTER" = "*" ]; then
+    die "a rehearsal needs a filter of a few tiles, not the planet"
+  fi
+  if [ -n "$REHEARSAL_BREAK_TILE" ]; then
+    [ "$REHEARSAL" = "1" ] || die "REHEARSAL_BREAK_TILE is for rehearsals only"
+    [[ "$REHEARSAL_BREAK_TILE" =~ ^[EW][0-9]+_[NS][0-9]+$ ]] || die "REHEARSAL_BREAK_TILE '$REHEARSAL_BREAK_TILE' is not a tile name"
+  fi
+  mkdir -p "$(dirname "$POINTER_FILE")" || die "could not create $(dirname "$POINTER_FILE")"
+}
+
 main() {
+  guard_mode
   detect_format_version
   guard_format_change
   command -v gh >/dev/null || die "gh is not installed"
@@ -402,8 +421,7 @@ main() {
     publish_shard "$i" "$of" "$WORK_DIR/shard.$i" || rc=1
   done
 
-  update_latest_pointer "$of"
-  prune_releases
+  write_pointer "$of"
 
   log "base URL (shard 1): $(shard_base 1)"
   return "$rc"

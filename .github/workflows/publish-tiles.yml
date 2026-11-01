@@ -1,10 +1,21 @@
 name: publish-tiles
 
+# publish-gazetteer reads this title to tell a rehearsal from the real thing
+# (workflow_run passes no inputs): keep the marker exactly " [rehearsal]".
+run-name: publish-tiles${{ inputs.rehearsal && ' [rehearsal]' || '' }}
+
 # Mirrors the BRouter rd5 segment tiles from brouter.de into GitHub Releases so
 # the Velorki app never downloads from brouter.de directly.
 #
 # See scripts/publish-tiles.sh for the batching, sharding and resume logic, and
 # README.md for the base URL the app should be pointed at.
+#
+# The snapshot goes to pending.json, not latest.json: publish-gazetteer starts
+# when this finishes, and moves latest.json (and prunes old snapshots) once the
+# gazetteers are in. Until then apps keep the previous complete snapshot.
+#
+# rehearsal: the same flow for a few tiles under rehearsal-<YYYYMMDD> tags and
+# rehearsal/*.json pointers, which no app reads (README.md, "Rehearsal").
 
 on:
   workflow_dispatch:
@@ -17,15 +28,20 @@ on:
         description: "Release tag. Empty means tiles-<YYYYMMDD>."
         required: false
         default: ""
-      keep_releases:
-        description: "How many snapshots to keep; older ones are deleted at the end. Tags in keep-tags.txt are always kept."
-        required: false
-        default: "2"
       allow_format_change:
         description: "Publish even though brouter.de moved to a new rd5 format. Only after an app that reads it is in the stores."
         required: false
         type: boolean
         default: false
+      rehearsal:
+        description: "Rehearse the whole flow on the tiles in 'filter': rehearsal-<date> tags and rehearsal/*.json pointers, nothing apps read."
+        required: false
+        type: boolean
+        default: false
+      break_tile:
+        description: "Rehearsal only: the gazetteer run that follows breaks this tile's parts (e.g. W10_N60), to rehearse a quarantine and its carry-over."
+        required: false
+        default: ""
   schedule:
     # 03:00 UTC on the 1st of every month. brouter.de rebuilds nightly, but a
     # 10 GB re-upload every night would be gratuitous - monthly is plenty for
@@ -35,11 +51,15 @@ on:
 # One run at a time. A second run must not race the first for the same release
 # assets, and two concurrent runs would double the load on brouter.de.
 # cancel-in-progress stays false so a half-finished upload is never abandoned.
+# This workflow neither moves latest.json nor prunes; publish-gazetteer does
+# both, one run at a time in its own group.
+# A rehearsal has its own group: a queued run replaces the one queued before it
+# in the same group, and a rehearsal must never displace a real run.
 concurrency:
-  group: publish-tiles
+  group: publish-tiles${{ inputs.rehearsal && '-rehearsal' || '' }}
   cancel-in-progress: false
 
-# The one job creates the release, uploads the tiles and commits the pointer.
+# The one job creates the release, uploads the tiles and commits pending.json.
 permissions:
   contents: write
 
@@ -63,41 +83,38 @@ jobs:
         run: df -h /
 
       - name: Publish tiles
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           FILTER: ${{ inputs.filter || '*' }}
           TAG: ${{ inputs.tag }}
-          KEEP_RELEASES: ${{ inputs.keep_releases || '2' }}
           ALLOW_FORMAT_CHANGE: ${{ inputs.allow_format_change == true && '1' || '0' }}
+          REHEARSAL: ${{ inputs.rehearsal == true && '1' || '0' }}
+          REHEARSAL_BREAK_TILE: ${{ inputs.break_tile }}
           WORK_DIR: ${{ runner.temp }}/tiles
         run: |
           # An empty TAG input must fall back to the script's own default.
           [ -n "${TAG:-}" ] || unset TAG
           scripts/publish-tiles.sh
 
+      # pending.json, or next.json on a format change not yet allowed (under
+      # rehearsal/ in a rehearsal). main may have moved during the hours this
+      # job runs: the file is copied onto a fresh checkout of main, again if
+      # the push is rejected.
       - name: Commit the pointer
         env:
-          GH_TOKEN: ${{ github.token }}
+          POINTER: ${{ steps.publish.outputs.pointer }}
         run: |
           set -euo pipefail
-          if git diff --quiet -- latest.json next.json && [ -z "$(git ls-files --others --exclude-standard -- next.json)" ]; then
-            echo "pointers unchanged"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add latest.json next.json 2>/dev/null || git add latest.json
-          if ! git diff --cached --quiet -- next.json; then
-            msg="next.json: $(jq -r .tag next.json) (new rd5 format, latest.json unchanged)"
+          tag="$(jq -r .tag "$POINTER")"
+          if [ "$(basename "$POINTER")" = next.json ]; then
+            msg="$POINTER: $tag (new rd5 format, latest.json unchanged)"
           else
-            msg="latest.json: $(jq -r .tag latest.json)"
+            msg="$POINTER: $tag (latest.json follows once its gazetteers are in)"
           fi
-          git commit -m "$msg"
-          # main may have moved during the hours this job runs; the pointer
-          # commit rebases onto it rather than failing at the very end.
-          git pull --rebase origin main
-          git push origin HEAD:main
+          # install -D: a rehearsal's rehearsal/ may not exist on main yet.
+          scripts/commit-to-main.sh "$msg" install -D -m 0644 "$GITHUB_WORKSPACE/$POINTER" "$POINTER"
 
       - name: Summary
         if: always()
@@ -105,9 +122,15 @@ jobs:
           {
             echo "### publish-tiles"
             echo
-            echo '```json'
-            cat latest.json 2>/dev/null || echo '(no latest.json)'
-            echo '```'
+            for f in pending.json next.json latest.json rehearsal/pending.json rehearsal/next.json rehearsal/latest.json; do
+              [ -f "$f" ] || continue
+              echo "\`$f\`:"
+              echo
+              echo '```json'
+              cat "$f"
+              echo '```'
+              echo
+            done
             echo
             echo "Releases:"
             gh release list --repo "$GITHUB_REPOSITORY" --limit 10

@@ -39,14 +39,22 @@ therefore reaches riders without an app release. A build can still be pinned to 
 tag a shipped build points at goes into `keep-tags.txt`, which prune never
 touches.
 
+**`latest.json` only ever names a complete snapshot.** `publish-tiles` writes
+a new snapshot to `pending.json` (same shape); `publish-gazetteer` then builds
+its gazetteers and, once every region is in and the tiles check out, moves it
+to `latest.json` in one commit and deletes `pending.json`. Until then apps keep
+the previous snapshot, rd5 and `.gaz` alike. See
+[When latest.json moves](#when-latestjson-moves).
+
 **A format change never moves `latest.json` by itself.** The manifest's
 `formatVersion` is read from the `lookups.dat` next to the tiles on brouter.de.
 When it differs from the one in `latest.json`, the snapshot is still published
-under its tag, but the run writes `next.json` instead of moving `latest.json`:
+under its tag, but the run writes `next.json` instead of `pending.json`:
 riders stay on the last snapshot their app can read, and the next app release is
-built and tested against `next.json`. Once that app is in the stores, run the
-workflow by hand with `allow_format_change` ticked; `latest.json` moves and
-`next.json` can be deleted.
+built and tested against `next.json` (dispatch `publish-gazetteer` with its tag
+to give it gazetteers; that never moves `latest.json`). Once that app is in the
+stores, run the workflow by hand with `allow_format_change` ticked: the snapshot
+goes to `pending.json`, and when `latest.json` takes it, `next.json` is deleted.
 
 ## Layout of a snapshot
 
@@ -77,6 +85,12 @@ workflow by hand with `allow_format_change` ticked; `latest.json` moves and
 }
 ```
 
+Each row also carries `contentSha256`: the sha256 of the rd5 with the 8-byte
+creation time in its footer zeroed (`scripts/snapshot.py rd5-digest`). `sha256`
+and `updatedAt` change with every monthly rebuild; `contentSha256` only when the
+tile does, so the app compares it and riders re-download only changed tiles. A
+row resumed from an older `manifest.tsv` has none, and the field is then absent.
+
 Unlike the self-hosted updater, this mirror always publishes `sha256`: the tiles
 cross two networks and an object store on the way here, and a hash per tile is
 cheap when it is computed once a month rather than on every sync pass.
@@ -97,8 +111,11 @@ that tile's entry in `manifest.json` carries a `gazetteer` object:
 
 ```json
 { "tile": "W20_N30", "bytes": 1527283, "updatedAt": "...", "sha256": "...",
-  "gazetteer": { "bytes": 262144, "sha256": "…", "updatedAt": "2026-09-16T01:00:00Z" } }
+  "gazetteer": { "bytes": 262144, "sha256": "…", "contentSha256": "…", "updatedAt": "2026-09-16T01:00:00Z" } }
 ```
+
+`contentSha256` is the digest of the file's rows without `meta.built_at`
+(`tools/gazetteer/digest.py`); absent when the builder checkout predates it.
 
 No `gazetteer` object means this mirror has no search index for that tile, and
 the app falls back to online search. The object's `sha256` is mandatory: the
@@ -121,7 +138,9 @@ builds them from OpenStreetMap:
    not stop its group; the publish step reports it and fails the run.
 3. **publish** downloads every group's artifact, merges them (Geofabrik extracts
    overlap, and a tile is normally cut by several of them, so `merge.py` dedupes
-   by OSM id and rebuilds the index), validates the result, then walks the
+   by OSM id and rebuilds the index) one tile at a time, checking each tile's
+   inputs and result and quarantining a tile that fails (see
+   [When a tile is quarantined](#when-a-tile-is-quarantined)), then walks the
    snapshot's shards: each `.gaz` goes to the shard whose `manifest.json` lists
    its tile, and that manifest gets its `gazetteer` objects refreshed. A merged
    tile with no `.rd5` anywhere in the snapshot is counted in the step summary
@@ -129,18 +148,152 @@ builds them from OpenStreetMap:
 
 It runs on `workflow_run` when `publish-tiles` finishes successfully, so the
 monthly snapshot on the 1st is followed by its gazetteers without a second
-schedule to keep in sync. Uploads are idempotent: an asset already on the
+schedule to keep in sync. It publishes into the snapshot in `pending.json`,
+and only if that run of `publish-tiles` wrote it (a by-hand run falls back to
+`latest.json`), and its last step decides whether that snapshot goes live -
+see below. Uploads are idempotent: an asset already on the
 release with the same sha256 is left alone. Every file's `built_at` is the
 snapshot's date (`SOURCE_DATE_EPOCH`), so rebuilding unchanged extracts gives
 the same bytes. After each shard's manifest is uploaded it is read back and
 held to the assets: a size or sha256 that differs fails the run.
 
-A run with failed regions ends **failed** after publishing what it built, and
-its step summary lists them. Fill the gap by dispatching the workflow with
-scope `custom` and those region ids: a custom run merges each tile it touches
-with the `.gaz` already on the release (`MERGE_PUBLISHED=1`), so the rebuilt
-extract's rows join the tile instead of replacing it. A world run does not
-merge with the published files; it rebuilds every tile from scratch.
+A run with failed regions (or a build group lost whole) ends **failed** after
+publishing what it built, and its step summary lists them; so does
+`gazetteer.missingRegions` in `pending.json`. Fill the gap by dispatching the
+workflow with scope `custom` and those region ids: a custom run merges each
+tile it touches with the `.gaz` already on the release (`MERGE_PUBLISHED=1`),
+so the rebuilt extract's rows join the tile instead of replacing it, and
+strikes them off the list. A world run does not merge with the published files;
+it rebuilds every tile from scratch and starts the list afresh.
+
+### When latest.json moves
+
+`scripts/promote-snapshot.sh`, the last step of `publish-gazetteer`, when the
+run published into the snapshot in `pending.json`:
+
+1. A world run records the regions it missed in `pending.json`
+   (`gazetteer.missingRegions`); a custom run strikes the ones it built.
+   `europe` and `north-america` runs count for nothing here. Until a world run
+   has finished, the snapshot stays pending.
+2. With no region missing, `scripts/snapshot.py check` reads every shard of
+   the snapshot: each rd5 and `.gaz` in a manifest must be on the release with
+   its size and sha256, and no tile may lose its rd5 or its `.gaz` against the
+   live snapshot. Tiles that have no `.gaz` here or there (sea, ice, land no
+   extract covers) are listed in the summary and are fine.
+3. Then `latest.json` becomes `pending.json` (minus the `gazetteer` state but
+   for `carriedOver` / `quarantined`, below), `pending.json` is deleted, and
+   `next.json` too if it was in the same format.
+
+Quarantined tiles do not hold a snapshot back: each one either carries last
+month's `.gaz` or had none last month either, so every tile has the data it
+had, and step 2 passes. The run still fails, after the move.
+
+Anything short of that fails the run and leaves `latest.json` alone; fix the
+cause and re-run (a custom run for missing regions, a world run otherwise). A
+tile that has really lost its data blocks the check every time: to promote
+anyway, commit `pending.json` as `latest.json` without its `gazetteer` key and
+delete `pending.json`. Commits go through `scripts/commit-to-main.sh`, which
+edits a fresh checkout of main and starts over if the push is rejected.
+
+**Pruning** happens right after, in the same step, and only there: it keeps the
+snapshots named by `latest.json`, `pending.json`, `next.json` and
+`keep-tags.txt`, every snapshot published after the live one (an upload in
+progress), and the newest `KEEP_RELEASES` (2, set in the workflow) up to the
+live one, so the snapshot riders had before the last move stays a month. It
+refuses to run if the live snapshot has no release.
+
+### When a tile is quarantined
+
+One bad tile must not stop the planet. `merge.py` merges tile by tile and
+checks each tile's inputs and its output with `check.py`; a tile that fails
+(or whose merge raises) is **quarantined**: left out, with the reason, and the
+other tiles go on (exit 3, the list in `quarantine.json`). Only a failure of
+the whole merge stops the run before publishing: no parts, every tile
+quarantined, a full disk, no memory. `publish-gazetteer.sh` then gives each
+quarantined tile a `.gaz` all the same (`scripts/snapshot.py carry`):
+
+| Outcome | When | What riders get |
+| --- | --- | --- |
+| `carried` | the live snapshot (`latest.json`) has a `.gaz` for the tile | last month's file: downloaded from its shard, held to its manifest's size and sha256, opened as a schema 1 file of that tile and run through `check.py` (a file that only fails today's stricter checks is carried anyway: it is the file riders have now), uploaded under the same name and listed in the manifest like any other |
+| `kept` | a `custom` run, and the release already has a `.gaz` for the tile; or nothing to carry but an earlier run's file is there | that file, untouched |
+| `none` | no `.gaz` for the tile here or in the live snapshot | none, as for a sea tile; the app searches online there, as it did |
+| `failed` | the live snapshot has one, but it could not be carried (download, size, sha256, schema) | the snapshot is **not promoted**: the check finds a tile that lost its `.gaz`, and riders stay on the live snapshot with everything |
+
+Each quarantined tile gets an `::error::` annotation and a row in the step
+summary (tile, reason, outcome), the run is marked **failed** (so it emails),
+and the tiles are recorded in the pointer: `gazetteer.carriedOver` (`{tile:
+reason (from tag)}`) and `gazetteer.quarantined` (`{tile: "kept|none|failed:
+reason"}`), kept in `latest.json` once the snapshot is promoted. A carried
+file was built by last month's builder: the same `schema_version` 1, which is
+all an app checks before opening a file (and an app skips a file it cannot
+read). Fix the builder (in the app repository), then re-run with scope
+`world` to refresh the tile; a `custom` run would merge into the carried file
+and keep last month's rows.
+
+### Rehearsal
+
+The whole flow - tiles, `pending`, gazetteers, check, promote, prune - can run
+on real Actions for a few tiles without touching anything apps read. Both
+workflows take a `rehearsal` input: tags are `rehearsal-<YYYYMMDD>` (never
+`tiles-`, never GitHub's "Latest" release), the pointers are
+`rehearsal/pending.json` and `rehearsal/latest.json` on `main` (apps read only
+the top-level `latest.json`), and pruning deletes only `rehearsal-*` releases.
+The real runs never read `rehearsal/` and never prune `rehearsal-*`; scripts
+refuse a `tiles-` tag in a rehearsal and a `rehearsal-` tag in a real run, and
+a rehearsal of the planet. `publish-gazetteer` learns that a `publish-tiles`
+run was a rehearsal from its run title (`publish-tiles [rehearsal]`), and
+before building checks that the pending pointer was written by that run. A
+rehearsal has its own concurrency group, so it never displaces a queued real
+run. It builds `REHEARSAL_REGIONS` (`europe/faroe-islands europe/malta`, set
+in `publish-gazetteer.yml`), which lie in the tiles `W10_N60` and `E10_N35`.
+
+Both repositories' changes must be on `main` first: `publish-gazetteer`
+checks out `tools/gazetteer` from the app repository's `main`, and only its
+`merge.py` quarantines.
+
+1. **A clean run.** Actions → `publish-tiles` → Run workflow on `main`:
+   filter `W10_N60 E10_N35`, tag empty, **rehearsal** ticked, break_tile
+   empty. Check:
+   * the run is titled `publish-tiles [rehearsal]`; a release
+     `rehearsal-<today>` with two `.rd5` and `manifest.json`, not marked
+     Latest; a commit `rehearsal/pending.json: rehearsal-<today> ...` on `main`;
+   * `publish-gazetteer` starts by itself; its plan summary says
+     **Rehearsal into `rehearsal-<today>`** with 2 extracts;
+   * it ends green; the release has `W10_N60.gaz` and `E10_N35.gaz`, and
+     ```sh
+     gh release download rehearsal-<today> -R orkitec/velorki-data -p manifest.json -O - \
+       | jq '.tiles[] | {tile, gazetteer}'
+     ```
+     shows a `gazetteer` object for both; a commit
+     `rehearsal/latest.json: rehearsal-<today>` and no `rehearsal/pending.json`;
+   * nothing real moved: `git log --oneline -3 -- latest.json pending.json`
+     shows no new commit, and
+     `https://raw.githubusercontent.com/orkitec/velorki-data/main/latest.json`
+     still names the same `tiles-` tag.
+2. **A quarantined tile.** `publish-tiles` again: the same filter, tag
+   `rehearsal-<today>-b`, **rehearsal** ticked, break_tile `W10_N60` (noted in
+   `rehearsal/pending.json`; the gazetteer run breaks that tile's parts before
+   the merge). Check:
+   * `publish-gazetteer` ends **red**, with an annotation *Gazetteer tile
+     W10_N60 quarantined ... carried over last month's .gaz from
+     rehearsal-<today>* and the table in the publish step's summary;
+   * it was promoted all the same: `rehearsal/latest.json` names
+     `rehearsal-<today>-b` and holds `gazetteer.carriedOver.W10_N60`;
+   * the `W10_N60` gazetteer `sha256` in the `-b` manifest equals the one in
+     the first manifest, and `E10_N35`'s was rebuilt.
+3. **Pruning** (optional). Two more rehearsals (`-c`, `-d`): after the last,
+   the oldest `rehearsal-*` releases are gone, the newest two up to the one in
+   `rehearsal/latest.json` stay, and `gh release list -R orkitec/velorki-data`
+   shows every `tiles-*` release untouched.
+
+**Clean up** when done:
+
+```sh
+gh release list -R orkitec/velorki-data --limit 200 --json tagName \
+  --jq '.[].tagName | select(startswith("rehearsal-"))' \
+  | while read -r tag; do gh release delete "$tag" -R orkitec/velorki-data --yes --cleanup-tag; done
+git pull && git rm -r rehearsal && git commit -m "Remove the rehearsal pointers" && git push
+```
 
 ### The asset budget
 
@@ -158,8 +311,10 @@ twice as many. GitHub's cap is **1000 assets per release**, which is why
 * **regions** — for `custom`, space-separated Geofabrik region ids as they read
   in a download URL, e.g. `europe/liechtenstein europe/portugal`. They are taken
   literally, so a non-leaf id like `europe/germany` builds that one extract.
-* **tag** — the snapshot to publish into. Empty means whatever `latest.json`
-  points at.
+* **tag** — the snapshot to publish into. Empty means `pending.json`'s, else
+  `latest.json`'s. Only the pending snapshot is ever promoted.
+* **rehearsal**, **break_tile** — see [Rehearsal](#rehearsal); scope is
+  ignored then.
 
 The plan is inspectable without Actions:
 
@@ -203,8 +358,7 @@ cap; 480 leaves room for `manifest.json`, `manifest.tsv` and upstream growth.
   `W20_N30 W25_N60 W75_N40`. `*` (the default) is the planet.
 * **tag** — defaults to `tiles-<YYYYMMDD>`. Re-running with an existing tag
   resumes into it.
-* **keep_releases** — snapshots to keep (default 2); older ones are deleted when
-  the run finishes.
+* **rehearsal**, **break_tile** — see [Rehearsal](#rehearsal).
 
 It also runs on its own at 03:00 UTC on the 1st of each month.
 
@@ -263,7 +417,7 @@ cache per tile, and a release holding two formats would hand them segments their
 
 Scheduled workflows are disabled automatically after 60 days of repository
 inactivity ([docs](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)) —
-the monthly run pushing `latest.json` counts as activity, so the schedule keeps
+the monthly run pushing `pending.json` counts as activity, so the schedule keeps
 itself alive.
 
 ## Licence and attribution

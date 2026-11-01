@@ -1,7 +1,10 @@
 name: publish-gazetteer
 
 # Builds the offline-search gazetteer files and publishes a `<TILE>.gaz` next to
-# every `<TILE>.rd5` of the current snapshot.
+# every `<TILE>.rd5` of a snapshot - the one in pending.json, which publish-tiles
+# has just written - and then makes that snapshot the one apps follow:
+# latest.json moves only once every region is in and every tile checks out
+# (scripts/promote-snapshot.sh). Old snapshots are pruned after that move.
 #
 # The rd5 tiles come from brouter.de (publish-tiles); the gazetteers are built
 # here from Geofabrik extracts, because nobody publishes them. A runner has
@@ -11,7 +14,13 @@ name: publish-gazetteer
 #
 # See scripts/gazetteer-plan.py (which extracts, in which groups),
 # scripts/gazetteer-build.sh (one group) and scripts/publish-gazetteer.sh
-# (merge and upload), and README.md's "Offline search files".
+# (merge and upload), scripts/promote-snapshot.sh (latest.json and pruning),
+# and README.md's "Offline search files".
+#
+# A rehearsal (the `rehearsal` input, or a publish-tiles run titled
+# "... [rehearsal]") runs the same flow over REHEARSAL_REGIONS into the
+# rehearsal-* snapshot in rehearsal/pending.json and promotes it to
+# rehearsal/latest.json. No app reads those; README.md, "Rehearsal".
 
 on:
   workflow_dispatch:
@@ -26,7 +35,16 @@ on:
         required: false
         default: ""
       tag:
-        description: "Snapshot tag to publish into. Empty means the tag in latest.json."
+        description: "Snapshot tag to publish into. Empty means the tag in pending.json, else the one in latest.json (rehearsal/ ones in a rehearsal)."
+        required: false
+        default: ""
+      rehearsal:
+        description: "Rehearsal: build 'regions' (default REHEARSAL_REGIONS) into the rehearsal-* snapshot of rehearsal/pending.json. Scope is ignored."
+        required: false
+        type: boolean
+        default: false
+      break_tile:
+        description: "Rehearsal only: break this tile's parts (e.g. W10_N60) so it is quarantined and carried over."
         required: false
         default: ""
   # The gazetteers describe the tiles of a snapshot, so they follow the snapshot:
@@ -38,10 +56,18 @@ on:
 
 # One run at a time: two runs would race for the same release assets and would
 # double the load on Geofabrik. cancel-in-progress stays false so a half-finished
-# upload is never abandoned.
+# upload is never abandoned. This group is also the only place latest.json moves
+# and releases are pruned: publish-tiles only writes pending.json.
+# A rehearsal has its own group: a queued run replaces the one queued before it
+# in the same group, and a rehearsal must never displace a real run.
 concurrency:
-  group: publish-gazetteer
+  group: publish-gazetteer${{ (inputs.rehearsal || endsWith(github.event.workflow_run.display_title, ' [rehearsal]')) && '-rehearsal' || '' }}
   cancel-in-progress: false
+
+env:
+  # What a rehearsal builds when no regions are given; publish-tiles is
+  # rehearsed with the tiles they fall in: "W10_N60 E10_N35".
+  REHEARSAL_REGIONS: europe/faroe-islands europe/malta
 
 # Read-only for the plan and the build jobs; only `publish` touches the release.
 permissions:
@@ -56,33 +82,126 @@ jobs:
     timeout-minutes: 30
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      tag: ${{ steps.snapshot.outputs.tag }}
       groups: ${{ steps.plan.outputs.groups }}
       regions: ${{ steps.plan.outputs.regions }}
       epoch: ${{ steps.snapshot.outputs.epoch }}
+      rehearsal: ${{ steps.mode.outputs.rehearsal }}
+      scope: ${{ steps.mode.outputs.state_scope }}
+      merge_published: ${{ steps.mode.outputs.merge_published }}
+      pointer_dir: ${{ steps.mode.outputs.pointer_dir }}
+      break_tile: ${{ steps.snapshot.outputs.break_tile }}
     steps:
       # No ref: a workflow_dispatch on a branch tests that branch's scripts;
       # a workflow_run lands on the default branch by itself.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      # Real or rehearsal. workflow_run carries no inputs, so a rehearsal of
+      # publish-tiles says so in its run title (its run-name). A rehearsal is
+      # a world run over its few regions: it rebuilds them from scratch and
+      # completes its snapshot; the plan just takes them as a custom list.
+      - name: Pick the mode
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          TITLE: ${{ github.event.workflow_run.display_title }}
+          REHEARSAL: ${{ inputs.rehearsal }}
+          SCOPE: ${{ inputs.scope }}
+          REGIONS: ${{ inputs.regions }}
+        run: |
+          set -euo pipefail
+          rehearsal=0
+          if [ "$EVENT" = workflow_run ]; then
+            case "$TITLE" in *" [rehearsal]") rehearsal=1 ;; esac
+          elif [ "$REHEARSAL" = true ]; then
+            rehearsal=1
+          fi
+          if [ "$rehearsal" = 1 ]; then
+            plan_scope=custom state_scope=world merge_published=0 pointer_dir=rehearsal/
+            regions="${REGIONS:-$REHEARSAL_REGIONS}"
+          else
+            plan_scope=world regions=""
+            [ "$EVENT" != workflow_dispatch ] || { plan_scope="$SCOPE"; regions="$REGIONS"; }
+            state_scope="$plan_scope" pointer_dir=""
+            merge_published=0
+            [ "$plan_scope" != custom ] || merge_published=1
+          fi
+          echo "mode: rehearsal=$rehearsal plan=$plan_scope state=$state_scope pointers=${pointer_dir:-./}"
+          {
+            echo "rehearsal=$rehearsal"
+            echo "plan_scope=$plan_scope"
+            echo "state_scope=$state_scope"
+            echo "regions=$regions"
+            echo "merge_published=$merge_published"
+            echo "pointer_dir=$pointer_dir"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Plan the extracts
         id: plan
         env:
-          SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'world' }}
-          REGIONS: ${{ inputs.regions }}
+          SCOPE: ${{ steps.mode.outputs.plan_scope }}
+          REGIONS: ${{ steps.mode.outputs.regions }}
         run: |
           python3 scripts/gazetteer-plan.py --scope "$SCOPE" --regions "$REGIONS"
 
+      # The snapshot is the input's, else the one waiting in pending.json, else
+      # (by hand only) the live one in latest.json - read from main as it is
+      # now, whichever branch this run's scripts come from; rehearsal/'s in a
+      # rehearsal, and its tag must be a rehearsal-* one, a real tag a tiles-*.
+      # After publish-tiles only pending.json counts, and only when that run
+      # wrote it: a pointer older than the run is not its snapshot.
       # Every built_at in the files is the snapshot's date (SOURCE_DATE_EPOCH),
       # so a rebuild of the same extracts is byte-identical and publish only
-      # uploads what changed. The first shard's manifest dates the snapshot,
-      # whether the tag comes from the input or from latest.json.
-      - name: Date the snapshot
+      # uploads what changed. The first shard's manifest dates the snapshot.
+      - name: Pick and date the snapshot
         id: snapshot
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
+          EVENT: ${{ github.event_name }}
+          STARTED: ${{ github.event.workflow_run.run_started_at }}
+          REHEARSAL: ${{ steps.mode.outputs.rehearsal }}
+          POINTER_DIR: ${{ steps.mode.outputs.pointer_dir }}
+          BREAK_TILE: ${{ inputs.break_tile }}
         run: |
-          tag="${TAG:-$(python3 -c 'import json; print(json.load(open("latest.json"))["tag"])')}"
+          set -euo pipefail
+          prefix=tiles-
+          [ "$REHEARSAL" != 1 ] || prefix=rehearsal-
+          pointers="pending.json latest.json"
+          [ "$EVENT" != workflow_run ] || pointers="pending.json"
+          tag="${TAG:-}"
+          git fetch --quiet origin main
+          if [ -z "$tag" ]; then
+            for f in $pointers; do
+              git show "FETCH_HEAD:$POINTER_DIR$f" > "$RUNNER_TEMP/pointer.json" 2>/dev/null || continue
+              tag="$(jq -r .tag "$RUNNER_TEMP/pointer.json")"
+              echo "snapshot from $POINTER_DIR$f"
+              if [ "$EVENT" = workflow_run ] && [[ "$(jq -r .generatedAt "$RUNNER_TEMP/pointer.json")" < "$STARTED" ]]; then
+                echo "::error::$POINTER_DIR$f ($tag) is older than the publish-tiles run that started this one ($STARTED); not its snapshot"
+                exit 1
+              fi
+              break
+            done
+          fi
+          # After publish-tiles that means it wrote next.json (a format change):
+          # dispatch this workflow with next.json's tag to build its gazetteers.
+          [ -n "$tag" ] || { echo "::error::no tag given and none in ${POINTER_DIR}{${pointers// /,}} on main"; exit 1; }
+          case "$tag" in
+            "$prefix"*) ;;
+            *) echo "::error::$tag is not a $prefix* snapshot (rehearsal=$REHEARSAL)"; exit 1 ;;
+          esac
+          # A rehearsal's break_tile: the input, else what publish-tiles noted.
+          break_tile=""
+          if [ "$REHEARSAL" = 1 ]; then
+            break_tile="$BREAK_TILE"
+            if [ -z "$break_tile" ] && [ -f "$RUNNER_TEMP/pointer.json" ]; then
+              break_tile="$(jq -r '.rehearsal.breakTile // empty' "$RUNNER_TEMP/pointer.json")"
+            fi
+          elif [ -n "$BREAK_TILE" ]; then
+            echo "::error::break_tile is for rehearsals only"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "break_tile=$break_tile" >> "$GITHUB_OUTPUT"
           gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern manifest.json \
             --output "$RUNNER_TEMP/manifest.json" --clobber
           epoch="$(python3 -c '
@@ -96,11 +215,14 @@ jobs:
 
       - name: Summary
         env:
-          SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'world' }}
+          SCOPE: ${{ steps.mode.outputs.plan_scope }}
+          REHEARSAL: ${{ steps.mode.outputs.rehearsal }}
+          TAG: ${{ steps.snapshot.outputs.tag }}
         run: |
           {
             echo "### publish-gazetteer: plan"
             echo
+            [ "$REHEARSAL" != 1 ] || echo "**Rehearsal** into \`$TAG\` (rehearsal/ pointers, rehearsal-* releases only)."
             echo "Scope \`$SCOPE\`: ${{ steps.plan.outputs.regions }} extract(s) in ${{ steps.plan.outputs.groups }} group(s), ${{ steps.plan.outputs.mb }} MB of PBF."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -160,7 +282,8 @@ jobs:
   publish:
     needs: [plan, build]
     permissions:
-      # Uploads the merged .gaz files onto the snapshot release.
+      # Uploads the merged .gaz files onto the snapshot release, commits
+      # latest.json / pending.json and prunes old releases.
       contents: write
     # Runs as long as the plan worked and at least one group produced an
     # artifact: a world run that loses two groups out of 24 should still publish
@@ -198,8 +321,35 @@ jobs:
           PARTS_DIR: ${{ github.workspace }}/parts
           MERGED_DIR: ${{ github.workspace }}/merged
           WORK_DIR: ${{ runner.temp }}/gaz-publish
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.plan.outputs.tag }}
           SOURCE_DATE_EPOCH: ${{ needs.plan.outputs.epoch }}
           # A custom run fills gaps: merge with the tiles already published.
-          MERGE_PUBLISHED: ${{ inputs.scope == 'custom' && '1' || '0' }}
+          MERGE_PUBLISHED: ${{ needs.plan.outputs.merge_published }}
+          SCOPE: ${{ needs.plan.outputs.scope }}
+          POINTER_DIR: ${{ needs.plan.outputs.pointer_dir }}
+          REHEARSAL_BREAK_TILE: ${{ needs.plan.outputs.break_tile }}
+          # A planned region whose directory never arrived counts as missing.
+          PLAN_MATRIX: ${{ needs.plan.outputs.matrix }}
+          RESULT_FILE: ${{ runner.temp }}/gaz-result.json
         run: scripts/publish-gazetteer.sh
+
+      # always(): a run with missing regions fails the step above after
+      # publishing, and its state still belongs in pending.json, so that a
+      # custom run for those regions can complete the snapshot later. So does
+      # a run with quarantined tiles, and that one is promoted all the same:
+      # each such tile carries last month's .gaz (or had none). Without a
+      # result file (publishing died) nothing is recorded and nothing moves.
+      - name: Promote the snapshot and prune
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          SCOPE: ${{ needs.plan.outputs.scope }}
+          REHEARSAL: ${{ needs.plan.outputs.rehearsal }}
+          RESULT_FILE: ${{ runner.temp }}/gaz-result.json
+          WORK_DIR: ${{ runner.temp }}/promote
+          # Snapshots kept besides those named by a pointer or keep-tags.txt.
+          KEEP_RELEASES: "2"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: scripts/promote-snapshot.sh

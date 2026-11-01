@@ -40,7 +40,21 @@
 #   * A failed region fails the run - after publishing. What was built is still
 #     better published than withheld, but a green run with a hole in it is how
 #     fifteen missing extracts went unnoticed once; the exit code and the step
-#     summary name the regions and the re-run that fills them.
+#     summary name the regions and the re-run that fills them. With the plan's
+#     matrix in PLAN_MATRIX, a region is missing unless its directory arrived,
+#     so a group lost whole (timed out, no artifact) counts as well.
+#   * One bad tile does not stop the world. merge.py quarantines a tile whose
+#     input or output fails check.py and merges the rest (exit 3, the tiles in
+#     quarantine.json). Each quarantined tile gets the live snapshot's .gaz of
+#     that tile instead (snapshot.py carry: downloaded, held to its manifest's
+#     sha256, opened, checked), uploaded and listed like any other, so riders
+#     keep last month's search there; with no earlier file the tile has none,
+#     as a sea tile has none. The run fails after publishing, with an
+#     ::error:: per tile and a table in the step summary, and the snapshot is
+#     still promoted (promote-snapshot.sh), because every tile has data.
+#   * Publishing does not make a snapshot live. RESULT_FILE gets the regions
+#     built and missing, and scripts/promote-snapshot.sh decides from that
+#     whether latest.json may point at the snapshot.
 set -uo pipefail
 
 : "${GH_REPO:?GH_REPO must be set, e.g. orkitec/velorki-data}"
@@ -49,11 +63,31 @@ set -uo pipefail
 PARTS_DIR="${PARTS_DIR:-parts}"
 MERGED_DIR="${MERGED_DIR:-merged}"
 WORK_DIR="${WORK_DIR:-${TMPDIR:-/tmp}/gaz-publish}"
-POINTER_FILE="${POINTER_FILE:-latest.json}"
+# "rehearsal/" in a rehearsal (README.md, "Rehearsal"): its pointers and its
+# rehearsal-* tags are a world apart from the real ones.
+POINTER_DIR="${POINTER_DIR:-}"
+# Without TAG: the snapshot waiting for its gazetteers, else the live one.
+if [ -z "${POINTER_FILE:-}" ]; then
+  POINTER_FILE="${POINTER_DIR}latest.json"
+  [ -f "${POINTER_DIR}pending.json" ] && POINTER_FILE="${POINTER_DIR}pending.json"
+fi
+# The live pointer, whose snapshot a quarantined tile's .gaz is carried over
+# from. Default: main's as it is now, else the checkout's.
+LIVE_POINTER="${LIVE_POINTER:-}"
+# Scope of the run (world, europe, north-america, custom): a custom run keeps
+# the file already published for a quarantined tile.
+SCOPE="${SCOPE:-world}"
+# Rehearsal only: break this tile's parts so that it is quarantined and
+# carried over, to see that path on real Actions.
+REHEARSAL_BREAK_TILE="${REHEARSAL_BREAK_TILE:-}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 # gh takes many assets per call; a few dozen keeps the command line sane and the
 # log readable without paying connection setup per file.
 UPLOAD_BATCH="${UPLOAD_BATCH:-40}"
 MERGE_PUBLISHED="${MERGE_PUBLISHED:-0}"
+# The plan job's matrix ({"group": [{"regions": "a b"}, ...]}); optional locally.
+PLAN_MATRIX="${PLAN_MATRIX:-}"
+RESULT_FILE="${RESULT_FILE:-$WORK_DIR/result.json}"
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 log() { printf '%s [gaz-publish] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
@@ -69,13 +103,26 @@ asset_digests() {
 }
 
 mkdir -p "$WORK_DIR" || die "could not create $WORK_DIR"
+rm -f "$RESULT_FILE"
 
 # ------------------------------------------------------------------- merge ---
 [ -d "$PARTS_DIR" ] || die "$PARTS_DIR does not exist - no build artifacts?"
 
 # One directory per built region, named by gazetteer-build.sh's slug.
-regions_built=$(find "$PARTS_DIR" -mindepth 2 -maxdepth 2 -type d | wc -l)
-failed_regions=$(cat "$PARTS_DIR"/*/FAILED.txt 2>/dev/null | tr '\n' ' ')
+# The slug is the region id with "/" as "__" (gazetteer-build.sh).
+find "$PARTS_DIR" -mindepth 2 -maxdepth 2 -type d -exec basename {} \; \
+  | sed 's#__#/#g' | sort -u > "$WORK_DIR/built.txt"
+regions_built=$(wc -l < "$WORK_DIR/built.txt")
+if [ -n "$PLAN_MATRIX" ]; then
+  python3 -c '
+import json, sys
+for group in json.loads(sys.argv[1])["group"]:
+    print("\n".join(group["regions"].split()))
+' "$PLAN_MATRIX" | sort -u > "$WORK_DIR/planned.txt" || die "PLAN_MATRIX is not the plan's matrix"
+  failed_regions=$(comm -23 "$WORK_DIR/planned.txt" "$WORK_DIR/built.txt" | tr '\n' ' ')
+else
+  failed_regions=$(cat "$PARTS_DIR"/*/FAILED.txt 2>/dev/null | tr '\n' ' ')
+fi
 parts_count=$(find "$PARTS_DIR" -name '*.gaz' | wc -l)
 [ "$parts_count" -gt 0 ] || die "no .gaz files under $PARTS_DIR"
 log "$parts_count part file(s) from $regions_built region(s)"
@@ -126,17 +173,92 @@ if [ "$MERGE_PUBLISHED" = "1" ]; then
   [ "$n_published" = "0" ] || merge_inputs+=( "$PUBLISHED_DIR" )
 fi
 
+if [ -n "$REHEARSAL_BREAK_TILE" ]; then
+  case "$TAG" in rehearsal-*) ;; *) die "REHEARSAL_BREAK_TILE is for rehearsals only" ;; esac
+  [[ "$REHEARSAL_BREAK_TILE" =~ ^[EW][0-9]+_[NS][0-9]+$ ]] || die "REHEARSAL_BREAK_TILE '$REHEARSAL_BREAK_TILE' is not a tile name"
+  log "rehearsal: breaking the parts of $REHEARSAL_BREAK_TILE so that it is quarantined"
+  find "$PARTS_DIR" -name "$REHEARSAL_BREAK_TILE.gaz" -exec python3 -c '
+import sqlite3, sys
+for path in sys.argv[1:]:
+    db = sqlite3.connect(path)
+    db.execute("UPDATE meta SET value = ? WHERE key = ?", ("rehearsal-broken", "schema_version"))
+    db.commit()
+    db.close()
+' {} +
+fi
+
 rm -rf "$MERGED_DIR"; mkdir -p "$MERGED_DIR"
+QUARANTINE="$WORK_DIR/quarantine.json"
+rm -f "$QUARANTINE"
 log "merging into $MERGED_DIR"
-python3 "$GAZETTEER_DIR/merge.py" "$MERGED_DIR" "${merge_inputs[@]}" \
-  || die "merge.py failed"
+if python3 "$GAZETTEER_DIR/merge.py" --help 2>/dev/null | grep -q -- --quarantine; then
+  python3 "$GAZETTEER_DIR/merge.py" --quarantine "$QUARANTINE" "$MERGED_DIR" "${merge_inputs[@]}"
+  rc=$?
+  # 3: some tiles quarantined, the rest merged. Anything else but 0 is the
+  # whole run (no inputs, every tile bad, disk full).
+  [ "$rc" = "0" ] || [ "$rc" = "3" ] || die "merge.py failed (exit $rc)"
+else
+  # A merge.py from before quarantine: all or nothing, outputs unchecked.
+  python3 "$GAZETTEER_DIR/merge.py" "$MERGED_DIR" "${merge_inputs[@]}" || die "merge.py failed"
+fi
+[ -f "$QUARANTINE" ] || echo '{"quarantined": []}' > "$QUARANTINE"
+
+# merge.py checks what it writes; an older one does not, so then every merged
+# file is checked here, and one that fails is quarantined the same way.
+if ! python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("outputsChecked") else 1)' "$QUARANTINE"; then
+  log "checking the merged files"
+  python3 - "$GAZETTEER_DIR" "$MERGED_DIR" "$QUARANTINE" <<'PY' || die "could not check the merged files"
+import glob, json, os, sys
+sys.path.insert(0, sys.argv[1])
+from check import check
+report = json.load(open(sys.argv[3]))
+for path in sorted(glob.glob(os.path.join(sys.argv[2], "*.gaz"))):
+    try:
+        check(path)
+    except Exception as error:  # one tile, whatever broke
+        os.remove(path)
+        tile = os.path.basename(path)[:-len(".gaz")]
+        report["quarantined"].append({"tile": tile, "reason": str(error)[:500], "inputs": []})
+report["outputsChecked"] = True
+json.dump(report, open(sys.argv[3], "w"), indent=1)
+PY
+fi
+
+# ------------------------------------------------------------- quarantine ---
+# Reasons name their files; the runner's directories add nothing to them.
+python3 - "$QUARANTINE" "$PARTS_DIR" "$WORK_DIR" "$MERGED_DIR" <<'PY' || die "unreadable $QUARANTINE"
+import json, sys
+path, *roots = sys.argv[1:]
+report = json.load(open(path))
+for entry in report["quarantined"]:
+    for root in roots:
+        entry["reason"] = entry["reason"].replace(root.rstrip("/") + "/", "")
+json.dump(report, open(path, "w"), indent=1)
+PY
+# Last month's file for every quarantined tile, from the live snapshot.
+CARRY="$WORK_DIR/carry.json"
+if [ -z "$LIVE_POINTER" ]; then
+  LIVE_POINTER="$WORK_DIR/live.json"
+  if ! { git fetch --quiet origin main 2>/dev/null \
+         && git show "FETCH_HEAD:${POINTER_DIR}latest.json" > "$LIVE_POINTER" 2>/dev/null; }; then
+    if [ -f "${POINTER_DIR}latest.json" ]; then
+      cp "${POINTER_DIR}latest.json" "$LIVE_POINTER"
+    else
+      rm -f "$LIVE_POINTER"
+    fi
+  fi
+fi
+python3 "$HERE/snapshot.py" carry --quarantine "$QUARANTINE" --live "$LIVE_POINTER" \
+    --tag "$TAG" --shards "${shards[*]}" --repo "$GH_REPO" --gazetteer-dir "$GAZETTEER_DIR" \
+    --into "$MERGED_DIR" --scope "$SCOPE" --work "$WORK_DIR/carry" --out "$CARRY" \
+  || die "could not carry over the quarantined tiles"
+n_quarantined="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$CARRY")"
 
 shopt -s nullglob
 merged_files=( "$MERGED_DIR"/*.gaz )
 shopt -u nullglob
 [ "${#merged_files[@]}" -gt 0 ] || die "merge.py produced no files"
-log "merged ${#merged_files[@]} tile(s); validating"
-python3 "$GAZETTEER_DIR/check.py" "${merged_files[@]}" || die "check.py rejected a merged file"
+log "${#merged_files[@]} tile(s) to publish, $n_quarantined quarantined"
 
 # --------------------------------------------------------------- per shard ---
 # Every tile any shard claimed, so the leftovers can be reported at the end.
@@ -322,8 +444,30 @@ done
     echo "Every merged tile had an rd5 to sit next to."
   fi
   echo
+  if [ "$n_quarantined" != "0" ]; then
+    echo "**$n_quarantined tile(s) quarantined** (merge.py could not merge or check them; the run is marked failed, the snapshot still goes live):"
+    echo
+    python3 - "$CARRY" <<'PY'
+import json, sys
+what = {
+    "carried": "last month's file carried over",
+    "kept": "the file already published stays",
+    "none": "no .gaz (none last month either)",
+    "failed": "**could not carry over: the snapshot will not go live**",
+}
+print("| Tile | Reason | Outcome |")
+print("| --- | --- | --- |")
+for tile, o in sorted(json.load(open(sys.argv[1])).items()):
+    cell = lambda text: text.replace("|", "\\|").replace("\n", " ")
+    outcome = what[o["outcome"]] + (" from `%s`" % o["from"] if o.get("from") else "")
+    if o.get("note") and o["outcome"] != "none":
+        outcome += " - " + o["note"]
+    print("| `%s` | %s | %s |" % (tile, cell(o["reason"]), cell(outcome)))
+PY
+    echo
+  fi
   if [ -n "${failed_regions// /}" ]; then
-    echo "**Region(s) that failed to build** (the run is marked failed; dispatch the workflow with scope \`custom\` and these regions to fill the gap):"
+    echo "**Region(s) that failed to build or never arrived** (the run is marked failed and latest.json does not move; dispatch the workflow with scope \`custom\` and these regions to fill the gap):"
     echo
     echo '```'
     printf '%s\n' $failed_regions | fmt -w 100
@@ -333,10 +477,42 @@ done
   fi
 } >> "$SUMMARY"
 
+# One annotation per quarantined tile, on the run's page and in its email.
+python3 - "$CARRY" <<'PY'
+import json, sys
+for tile, o in sorted(json.load(open(sys.argv[1])).items()):
+    tail = {"carried": "carried over last month's .gaz from %s" % o.get("from"),
+            "kept": "kept the .gaz already published",
+            "none": "no .gaz, there was none last month either",
+            "failed": "NOT carried over (%s); the snapshot will not go live" % o.get("note")}[o["outcome"]]
+    message = "%s: %s; %s" % (tile, o["reason"], tail)
+    message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print("::error title=Gazetteer tile %s quarantined::%s" % (tile, message))
+PY
+
+# Everything above was published; what promote-snapshot.sh needs to know.
+python3 -c '
+import json, sys
+built = [line.strip() for line in open(sys.argv[1]) if line.strip()]
+carry = json.load(open(sys.argv[4]))
+def text(o):
+    return "; ".join(part for part in (o["reason"], o.get("note", "")) if part)
+json.dump({
+    "built": built,
+    "missing": sys.argv[3].split(),
+    "carriedOver": {t: "%s (from %s)" % (text(o), o["from"]) for t, o in carry.items() if o["outcome"] == "carried"},
+    "quarantined": {t: "%s: %s" % (o["outcome"], text(o)) for t, o in carry.items() if o["outcome"] != "carried"},
+}, open(sys.argv[2], "w"), indent=1)
+' "$WORK_DIR/built.txt" "$RESULT_FILE" "$failed_regions" "$CARRY" || die "could not write $RESULT_FILE"
+
 log "done - $total_up uploaded, $total_skip unchanged, $n_orphan tile(s) without an rd5"
 if [ -n "${failed_regions// /}" ]; then
   log "FAILED region(s): $failed_regions"
   log "fill the gap: dispatch publish-gazetteer with scope 'custom' and these regions (it merges with the published tiles)"
+  exit 1
+fi
+if [ "$n_quarantined" != "0" ]; then
+  log "FAILED $n_quarantined tile(s) quarantined (see the summary); published all the same"
   exit 1
 fi
 exit 0
