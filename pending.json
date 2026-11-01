@@ -1,0 +1,27 @@
+{
+  "tag": "tiles-20261102",
+  "generatedAt": "2026-11-01T20:23:30Z",
+  "formatVersion": "11.2",
+  "brouterVersion": "v1.7.10",
+  "source": "https://brouter.de/brouter/segments4/",
+  "baseUrl": "https://github.com/orkitec/velorki-data/releases/download/tiles-20261102/",
+  "shardCount": 3,
+  "shards": [
+    {
+      "tag": "tiles-20261102",
+      "baseUrl": "https://github.com/orkitec/velorki-data/releases/download/tiles-20261102/",
+      "tileCount": 480
+    },
+    {
+      "tag": "tiles-20261102-s2",
+      "baseUrl": "https://github.com/orkitec/velorki-data/releases/download/tiles-20261102-s2/",
+      "tileCount": 480
+    },
+    {
+      "tag": "tiles-20261102-s3",
+      "baseUrl": "https://github.com/orkitec/velorki-data/releases/download/tiles-20261102-s3/",
+      "tileCount": 182
+    }
+  ],
+  "tileCount": 1142
+}
