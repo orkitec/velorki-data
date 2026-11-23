@@ -45,7 +45,9 @@ failed=""
 for region in $REGIONS; do
   pbf="$WORK_DIR/$(slug "$region").osm.pbf"
   dest="$OUT_DIR/$(slug "$region")"
-  url="$GEOFABRIK_URL/$region-latest.osm.pbf"
+  # Each extract has a directory of its own since November 2026:
+  # europe/liechtenstein/liechtenstein-latest.osm.pbf.
+  url="$GEOFABRIK_URL/$region/${region##*/}-latest.osm.pbf"
 
   log "$region: downloading $url"
   if ! curl -fsSL --retry 3 --retry-delay 30 --retry-connrefused --max-time 3600 \

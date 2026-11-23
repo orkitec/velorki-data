@@ -107,11 +107,24 @@ def load_index(source: str) -> list[dict]:
 
 
 def path_of(properties: dict) -> str | None:
-    """Region path derived from the pbf URL, e.g. 'europe/liechtenstein'."""
+    """Region path derived from the pbf URL, e.g. 'europe/liechtenstein'.
+
+    Since November 2026 Geofabrik puts every extract in a directory of its own
+    (europe/liechtenstein/liechtenstein-latest.osm.pbf, where it used to be
+    europe/liechtenstein-latest.osm.pbf). The repeated last segment is dropped,
+    so the path stays the region's place in the tree: without that, no path is
+    another's parent and every continent becomes a leaf.
+    """
     url = (properties.get("urls") or {}).get("pbf")
     if not url or not url.startswith(DOWNLOAD_PREFIX) or not url.endswith(PBF_SUFFIX):
         return None
-    return url[len(DOWNLOAD_PREFIX) : -len(PBF_SUFFIX)]
+    path = url[len(DOWNLOAD_PREFIX) : -len(PBF_SUFFIX)]
+    head, _, last = path.rpartition("/")
+    # The id is the bare name ("liechtenstein"), or for US states "us/<state>".
+    name = str(properties.get("id") or "").rsplit("/", 1)[-1]
+    if head and head.rsplit("/", 1)[-1] == last == name:
+        return head
+    return path
 
 
 def region_paths(features: list[dict]) -> dict[str, str]:
@@ -124,6 +137,11 @@ def region_paths(features: list[dict]) -> dict[str, str]:
             paths[path] = properties["urls"]["pbf"]
     if not paths:
         raise PlanError("index held no pbf URLs - did the index layout change?")
+    # The paths are this script's own reading of Geofabrik's URLs; if they stop
+    # matching the names it keeps, the URLs have moved again.
+    unknown = sorted(set(REDUNDANT) - set(paths)) + sorted({"europe", "europe/germany"} - set(paths))
+    if unknown:
+        raise PlanError("index paths no longer match the known layout (" + " ".join(unknown) + ") - did the URLs change?")
     return paths
 
 
