@@ -1,0 +1,17 @@
+{
+  "tag": "rehearsal-20261123",
+  "generatedAt": "2026-11-23T10:53:54Z",
+  "formatVersion": "11.2",
+  "brouterVersion": "v1.7.10",
+  "source": "https://brouter.de/brouter/segments4/",
+  "baseUrl": "https://github.com/orkitec/velorki-data/releases/download/rehearsal-20261123/",
+  "shardCount": 1,
+  "shards": [
+    {
+      "tag": "rehearsal-20261123",
+      "baseUrl": "https://github.com/orkitec/velorki-data/releases/download/rehearsal-20261123/",
+      "tileCount": 2
+    }
+  ],
+  "tileCount": 2
+}
